@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>党政办信息跟踪与智能整理系统 · Demo</title>
+<link rel="stylesheet" href="/static/style.css">
+<!-- Vue 3 + Vue Router 4 (CDN) -->
+<script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/vue-router@4.3.0/dist/vue-router.global.prod.js"></script>
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">党</div>
+      <div>
+        <div class="brand-name">党政办信息系统</div>
+        <div class="brand-sub">跟踪 · 整理 · 协同</div>
+      </div>
+    </div>
+    <nav>
+      <router-link to="/" exact-active-class="active"><span>📊</span>工作台</router-link>
+      <router-link to="/sources" active-class="active"><span>🗂️</span>信息源管理</router-link>
+      <router-link to="/tasks" active-class="active"><span>⏱️</span>采集任务</router-link>
+      <router-link to="/review" active-class="active"><span>📝</span>审核工作台</router-link>
+      <router-link to="/briefs" active-class="active"><span>📰</span>简报管理</router-link>
+      <router-link to="/knowledge" active-class="active"><span>🔎</span>知识库检索</router-link>
+      <router-link to="/wecom" active-class="active"><span>💬</span>企微推送</router-link>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="user">
+        <div class="avatar">李</div>
+        <div>
+          <div class="user-name">李审核</div>
+          <div class="user-role">综合组 · 审核人员</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1>{{ pageTitle }}</h1>
+        <div class="breadcrumb">党政办 / {{ pageTitle }}</div>
+      </div>
+      <div class="topbar-actions">
+        <span class="badge">Demo · v1.0 · Vue 3</span>
+      </div>
+    </header>
+    <section class="content">
+      <router-view></router-view>
+    </section>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

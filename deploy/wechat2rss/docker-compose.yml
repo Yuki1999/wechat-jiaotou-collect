@@ -1,0 +1,65 @@
+# ============================================================================
+# wechat2rss 私有部署 — Docker Compose 配置
+# 模板出处：官方 https://wechat2rss.xlab.app/docker-compose.yml （已按本项目调整）
+# 修改时间：2026-06
+#
+# 用法：
+#   1) 在同目录下 cp .env.example .env，按提示填三项激活信息
+#   2) 执行 ./deploy.sh up
+# ============================================================================
+
+services:
+  wechat2rss:
+    container_name: wechat2rss
+    # 主镜像（如 Docker Hub 不通可改用 docker.xlab.app/ttttmr/wechat2rss:latest）
+    image: ${WECHAT2RSS_IMAGE:-ttttmr/wechat2rss:latest}
+    restart: unless-stopped
+    environment:
+      # ===== 必填：授权信息（购买后由 wechat2rss.xlab.app 发送） =====
+      - LIC_EMAIL=${LIC_EMAIL}
+      - LIC_CODE=${LIC_CODE}
+
+      # 必填：服务对外可访问的地址 + 端口（用于生成 RSS feed 内的 link，不影响监听端口）
+      # 例：内网 "192.168.11.22:8080"  公网 "rss.example.gov.cn"
+      - RSS_HOST=${RSS_HOST}
+
+      # 可选：开启 https 链接（仅影响生成的 link 协议）
+      - RSS_HTTPS=${RSS_HTTPS:-0}
+
+      # 强烈建议：服务密码，保护 /add /del /list /opml 等写/读接口
+      # 设置后调用时需带 ?k=xxx
+      - RSS_TOKEN=${RSS_TOKEN}
+
+      # 可选：RSS 输出最多多少条，默认 20
+      - RSS_MAX_ITEM_COUNT=${RSS_MAX_ITEM_COUNT:-50}
+
+      # 可选：每个公众号本地保留多少历史；-1 表示全部保留
+      - RSS_KEEP_OLD_COUNT=${RSS_KEEP_OLD_COUNT:--1}
+
+      # 可选：对 feed URL 加密（防止枚举）；启用后 URL 会带签名串
+      - RSS_ENC_FEED_ID=${RSS_ENC_FEED_ID:-0}
+
+      # 可选：图片代理；0 启用代理（默认），1 关闭、直出微信原图（多数情况下保持 0）
+      - RSS_PROXY_DISABLE_IMG=${RSS_PROXY_DISABLE_IMG:-0}
+
+    volumes:
+      - ./data:/wechat2rss          # 数据库与配置持久化
+      - ./logs:/wechat2rss/logs     # 运行日志（出错时排查用）
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+        window: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+# ============================================================================
+# 如果你的网络访问 Docker Hub 不稳，可在 ~/.docker/daemon.json 配置镜像源；
+# 或在 .env 里把 WECHAT2RSS_IMAGE 改成下面这个官方备用：
+#   WECHAT2RSS_IMAGE=docker.xlab.app/ttttmr/wechat2rss:latest
+# ============================================================================
