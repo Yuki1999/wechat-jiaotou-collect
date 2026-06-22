@@ -29,7 +29,12 @@ deploy/wechat2rss/.env
 deploy/wechat2rss/data/
 deploy/wechat2rss/logs/
 deploy/wechat2rss/backups/
-wewe-data/
+
+# 本地 Go 工具链缓存（如使用项目内 Go）
+.gotool/
+
+# Python 虚拟环境
+deploy/crawler/venv/
 
 # ============================================================
 # 开发与编辑器

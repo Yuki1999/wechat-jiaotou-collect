@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>党政办信息跟踪与智能整理系统 · Demo</title>
 <link rel="stylesheet" href="/static/style.css">
-<!-- Vue 3 + Vue Router 4 (CDN) -->
 <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
 <script src="https://unpkg.com/vue-router@4.3.0/dist/vue-router.global.prod.js"></script>
 </head>
@@ -22,6 +21,7 @@
     <nav>
       <router-link to="/" exact-active-class="active"><span>📊</span>工作台</router-link>
       <router-link to="/sources" active-class="active"><span>🗂️</span>信息源管理</router-link>
+      <router-link to="/wechat2rss" active-class="active"><span>📡</span>公众号订阅</router-link>
       <router-link to="/tasks" active-class="active"><span>⏱️</span>采集任务</router-link>
       <router-link to="/review" active-class="active"><span>📝</span>审核工作台</router-link>
       <router-link to="/briefs" active-class="active"><span>📰</span>简报管理</router-link>
@@ -43,16 +43,74 @@
     <header class="topbar">
       <div>
         <h1>{{ pageTitle }}</h1>
-        <div class="breadcrumb">党政办 / {{ pageTitle }}</div>
+        <div class="breadcrumb">党政办<span class="sep">/</span>{{ pageTitle }}</div>
       </div>
       <div class="topbar-actions">
-        <span class="badge">Demo · v1.0 · Vue 3</span>
+        <span class="topbar-stat" title="启用中的信息源">📡 <b>{{ globalStats.sources_active || 0 }}</b> 源</span>
+        <span class="topbar-stat" title="待审核条目"
+              :class="{ urgent: (globalStats.pending||0) > 20 }">📝 待审 <b>{{ globalStats.pending || 0 }}</b></span>
+        <span class="topbar-stat" title="简报总数">📰 简报 <b>{{ globalStats.briefs || 0 }}</b></span>
+        <span class="topbar-clock">{{ clock }}</span>
+        <span class="badge">Demo · v2.1</span>
       </div>
     </header>
     <section class="content">
-      <router-view></router-view>
+      <router-view v-slot="{ Component }">
+        <transition name="page" mode="out-in">
+          <component :is="Component" />
+        </transition>
+      </router-view>
     </section>
   </main>
+
+  <!-- 全局组件容器 -->
+  <div class="global-progress" :class="{ active: ui.progress.active, done: ui.progress.done }"></div>
+
+  <div class="toast-stack">
+    <div v-for="t in ui.toasts" :key="t.id"
+         class="toast" :class="[t.type, { leaving: t.leaving }]">
+      <span class="toast-icon">{{ t.icon }}</span>
+      <span class="toast-body">{{ t.message }}</span>
+      <button class="toast-close" @click="closeToast(t.id)">✕</button>
+    </div>
+  </div>
+
+  <div v-if="ui.modal.show" class="modal-mask" @click.self="resolveModal(false)">
+    <div class="modal" :class="{ lg: ui.modal.large }">
+      <div class="modal-head">
+        <h3>{{ ui.modal.title }}</h3>
+        <button class="modal-close" @click="resolveModal(false)">✕</button>
+      </div>
+      <div class="modal-body">
+        <div v-if="ui.modal.message" style="white-space:pre-wrap;">{{ ui.modal.message }}</div>
+        <div v-if="ui.modal.inputs" class="col" style="gap:12px; margin-top:8px;">
+          <div v-for="(it,i) in ui.modal.inputs" :key="i" class="field">
+            <label>{{ it.label }}<span v-if="it.required" class="req">*</span></label>
+            <select v-if="it.type==='select'" v-model="it.value">
+              <option v-for="o in it.options" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+            <textarea v-else-if="it.type==='textarea'" v-model="it.value" :placeholder="it.placeholder"></textarea>
+            <input v-else v-model="it.value" :placeholder="it.placeholder">
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot" v-if="ui.modal.showFoot">
+        <button class="btn ghost" @click="resolveModal(false)">{{ ui.modal.cancelText || '取消' }}</button>
+        <button class="btn primary" @click="resolveModal(true)">{{ ui.modal.okText || '确定' }}</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="ui.drawer.show" class="drawer-mask" @click="ui.drawer.show=false"></div>
+  <transition name="page">
+    <div v-if="ui.drawer.show" class="drawer">
+      <div class="drawer-head">
+        <h3>{{ ui.drawer.title }}</h3>
+        <button class="modal-close" @click="ui.drawer.show=false">✕</button>
+      </div>
+      <div class="drawer-body" v-html="ui.drawer.content"></div>
+    </div>
+  </transition>
 </div>
 <script src="/static/app.js"></script>
 </body>

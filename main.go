@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"embed"
@@ -39,7 +41,7 @@ type Source struct {
 	ID          int       `json:"id"`
 	Unit        string    `json:"unit"`
 	Category    string    `json:"category"`
-	Type        string    `json:"type"` // website / wechat / rss / wewe-rss
+	Type        string    `json:"type"` // website / wechat / rss / wechat2rss
 	Kind        string    `json:"kind"` // html_list / rss  —— 决定采集器
 	URL         string    `json:"url"`
 	Frequency   string    `json:"frequency"`
@@ -175,7 +177,7 @@ func loadStore() *Store {
 
 // ===================== 种子数据（真实信息源） =====================
 // 接入苏州工业园区管理委员会官网 5 个真实栏目（HTML 抓取）。
-// 同时预留两条 RSS / WeWe RSS 占位条目（默认停用，部署 WeWe RSS 后填入 URL 即可启用）。
+// 同时预留两条 RSS / wechat2rss 占位条目（默认停用，部署 wechat2rss 后填入 URL 即可启用）。
 
 func seed(s *Store) {
 	users := []User{
@@ -227,11 +229,11 @@ func seed(s *Store) {
 			Frequency: "daily", OwnerName: `赵干事`, Group: `综合组`,
 			Active: true, Authorized: true,
 		},
-		// 占位：WeWe RSS（用户部署后改 URL 并启用）。kind=rss 直接走标准 RSS 解析器
+		// 占位：wechat2rss（用户部署后改 URL 并启用）。kind=rss 直接走标准 RSS 解析器
 		{
-			Unit: `[占位] WeWe RSS · 苏州工业园区发布（公众号）`, Category: `企业类`,
-			Type: "wewe-rss", Kind: "rss",
-			URL:       "http://127.0.0.1:4000/feeds/REPLACE_WITH_FEED_ID.rss",
+			Unit: `[占位] wechat2rss · 苏州工业园区发布（公众号）`, Category: `企业类`,
+			Type: "wechat2rss", Kind: "rss",
+			URL:       "http://127.0.0.1:8090/feed/REPLACE_WITH_FEED_SHA1.xml",
 			Frequency: "daily", OwnerName: `王干事`, Group: `招商组`,
 			Active: false, Authorized: false,
 		},
@@ -491,7 +493,7 @@ func sha256hex(s string) string {
 	return hex.EncodeToString(h[:])[:16]
 }
 
-// ----- RSS / Atom 解析（用于 WeWe RSS 与通用 RSS） -----
+// ----- RSS / Atom 解析（用于 wechat2rss 与通用 RSS） -----
 
 type rssDoc struct {
 	XMLName xml.Name `xml:"rss"`
@@ -591,7 +593,205 @@ func parseFeedTime(s string) time.Time {
 	return time.Time{}
 }
 
+// ===================== 通用采集微服务 (crawl4ai) =====================
+//
+// 通过环境变量 CRAWLER_BASE 配置 Python 采集微服务地址，默认 http://127.0.0.1:8070
+// 微服务不可达时，collectHTML 自动降级到原有正则解析，不影响业务。
+
+var crawlerBase = "http://127.0.0.1:8070"
+
+func init() {
+	if v := os.Getenv("CRAWLER_BASE"); v != "" {
+		crawlerBase = strings.TrimRight(v, "/")
+	}
+}
+
+// crawlerHealth 探测微服务是否在线
+func crawlerHealth() bool {
+	resp, err := httpClient.Get(crawlerBase + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// crawlerDetail 调用 Python 微服务抓单页详情
+type crawlerDetailResult struct {
+	OK             bool   `json:"ok"`
+	Error          string `json:"error"`
+	Title          string `json:"title"`
+	ContentText    string `json:"content_text"`
+	ContentMarkdn  string `json:"content_markdown"`
+	PublishTime    string `json:"publish_time"`
+}
+
+func crawlerDetail(ctx context.Context, target string) (*crawlerDetailResult, error) {
+	body, _ := json.Marshal(map[string]string{"url": target})
+	req, err := http.NewRequestWithContext(ctx, "POST", crawlerBase+"/crawl_detail", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("crawler HTTP %d", resp.StatusCode)
+	}
+	var r crawlerDetailResult
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// crawlerListItem 列表页条目
+type crawlerListItem struct {
+	URL         string `json:"url"`
+	Title       string `json:"title"`
+	PublishTime string `json:"publish_time"`
+}
+type crawlerListResult struct {
+	OK    bool              `json:"ok"`
+	Error string            `json:"error"`
+	Items []crawlerListItem `json:"items"`
+}
+
+func crawlerList(ctx context.Context, target string, max int) (*crawlerListResult, error) {
+	body, _ := json.Marshal(map[string]interface{}{"url": target, "max": max})
+	req, err := http.NewRequestWithContext(ctx, "POST", crawlerBase+"/crawl_list", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("crawler HTTP %d", resp.StatusCode)
+	}
+	var r crawlerListResult
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
 // ----- 任务执行 -----
+
+// 把 frequency 字段（"4h" / "daily" / "weekly" / "1h" 等）解析为时间间隔。
+// 无法识别的值回退到 24 小时。
+func frequencyInterval(freq string) time.Duration {
+	switch strings.TrimSpace(strings.ToLower(freq)) {
+	case "", "daily":
+		return 24 * time.Hour
+	case "weekly":
+		return 7 * 24 * time.Hour
+	case "hourly":
+		return time.Hour
+	case "4h":
+		return 4 * time.Hour
+	case "1h":
+		return time.Hour
+	case "30m":
+		return 30 * time.Minute
+	}
+	// 兜底：尝试 Go 时长解析，如 "2h30m"
+	if d, err := time.ParseDuration(freq); err == nil && d > 0 {
+		return d
+	}
+	return 24 * time.Hour
+}
+
+// schedulerLoop 在后台 goroutine 中长驻，每分钟扫一次，
+// 对所有 Active 且距离上次成功超过 frequency 的源串行触发采集。
+// 失败的源采用指数退避：失败次数 N 次 → 至少等待 N × frequency 再重试，封顶 24h。
+func schedulerLoop() {
+	// 启动后稍等一下再开始，避免与冷启动其他初始化抢资源
+	time.Sleep(30 * time.Second)
+	log.Println("[scheduler] started, tick = 1m")
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		runSchedulerTick()
+		<-ticker.C
+	}
+}
+
+func runSchedulerTick() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[scheduler] panic recovered: %v", r)
+		}
+	}()
+	now := time.Now()
+	// 复制一份 ID 列表，避免长时间持锁阻塞 API
+	store.mu.RLock()
+	type todo struct {
+		idx     int
+		id      int
+		unit    string
+		nextDue time.Time
+	}
+	candidates := make([]todo, 0, len(store.Sources))
+	for i, s := range store.Sources {
+		if !s.Active {
+			continue
+		}
+		interval := frequencyInterval(s.Frequency)
+		// 失败时退避：fail_count 越高，间隔越长（最多 24h）
+		if s.FailCount > 0 {
+			backoff := time.Duration(s.FailCount) * interval
+			if backoff > 24*time.Hour {
+				backoff = 24 * time.Hour
+			}
+			interval = backoff
+		}
+		var due time.Time
+		if s.LastSuccess.IsZero() {
+			// 从未成功过：立刻视为到期（但只在第一次 tick 时跑一次，避免连失败洗屏）
+			due = now.Add(-time.Second)
+		} else {
+			due = s.LastSuccess.Add(interval)
+		}
+		if !due.After(now) {
+			candidates = append(candidates, todo{i, s.ID, s.Unit, due})
+		}
+	}
+	store.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return
+	}
+	log.Printf("[scheduler] %d source(s) due, running serially", len(candidates))
+	for _, c := range candidates {
+		store.mu.Lock()
+		// 取索引可能因外部修改而无效，重新查找
+		var src *Source
+		for i := range store.Sources {
+			if store.Sources[i].ID == c.id {
+				src = &store.Sources[i]
+				break
+			}
+		}
+		if src == nil || !src.Active {
+			store.mu.Unlock()
+			continue
+		}
+		tr := runOneCollect(store, src)
+		store.Tasks = append(store.Tasks, tr)
+		store.mu.Unlock()
+		store.save()
+		log.Printf("[scheduler] %s → %s (found=%d new=%d)", c.unit, tr.Status, tr.Found, tr.NewItems)
+		// 礼貌停顿，避免对同一目标站短时间内打太密
+		time.Sleep(1 * time.Second)
+	}
+}
 
 func runOneCollect(s *Store, src *Source) TaskRun {
 	now := time.Now()
@@ -615,6 +815,80 @@ func runOneCollect(s *Store, src *Source) TaskRun {
 }
 
 func collectHTML(ctx context.Context, s *Store, src *Source, tr TaskRun) TaskRun {
+	// 优先走 crawl4ai 通用采集微服务
+	if crawlerHealth() {
+		tr2 := collectHTMLViaCrawler(ctx, s, src, tr)
+		if tr2.Status == "success" {
+			return tr2
+		}
+		// 微服务跑失败 → 降级到原正则，并把微服务错误记到日志
+		log.Printf("[collect] crawler service failed for %s: %s, falling back to regex", src.Unit, tr2.Error)
+		if tr2.Error != "" {
+			// 不直接返回，继续走下面原逻辑
+		}
+	}
+	return collectHTMLRegex(ctx, s, src, tr)
+}
+
+// collectHTMLViaCrawler 走 Python crawl4ai 微服务的实现
+func collectHTMLViaCrawler(ctx context.Context, s *Store, src *Source, tr TaskRun) TaskRun {
+	listRes, err := crawlerList(ctx, src.URL, 15)
+	if err != nil {
+		return failTask(s, src, tr, "crawler /crawl_list 调用失败: "+err.Error())
+	}
+	if !listRes.OK {
+		return failTask(s, src, tr, "crawler 列表页抓取失败: "+listRes.Error)
+	}
+	tr.Found = len(listRes.Items)
+	if len(listRes.Items) == 0 {
+		return failTask(s, src, tr, "列表页未解析到条目（页面结构可能变化）")
+	}
+	known := map[string]bool{}
+	for _, a := range s.Articles {
+		known[a.URL] = true
+	}
+	newCount := 0
+	for _, it := range listRes.Items {
+		if known[it.URL] {
+			continue
+		}
+		detail, err := crawlerDetail(ctx, it.URL)
+		if err != nil || !detail.OK {
+			continue
+		}
+		title := detail.Title
+		if title == "" {
+			title = it.Title
+		}
+		content := detail.ContentText
+		if len([]rune(content)) < 30 {
+			continue
+		}
+		pub := parseFlexibleTime(detail.PublishTime)
+		if pub.IsZero() {
+			pub = parseFlexibleTime(it.PublishTime)
+		}
+		a := Article{
+			ID: s.nextID("article"), SourceID: src.ID, Unit: src.Unit, SourceType: src.Type,
+			Title: title, Content: content, URL: it.URL,
+			PublishTime: pub, FetchTime: time.Now(),
+			ContentHash: sha256hex(title + content),
+			Status:      "collected", Category: src.Category,
+			OwnerID: src.OwnerID, OwnerName: src.OwnerName, Group: src.Group,
+		}
+		runOneAI(&a)
+		s.Articles = append(s.Articles, a)
+		newCount++
+	}
+	tr.NewItems = newCount
+	tr.FinishedAt = time.Now()
+	src.LastSuccess = time.Now()
+	src.FailCount = 0
+	return tr
+}
+
+// collectHTMLRegex 原有正则解析实现（保留作为 fallback）
+func collectHTMLRegex(ctx context.Context, s *Store, src *Source, tr TaskRun) TaskRun {
 	listHTML, err := httpGet(ctx, src.URL)
 	if err != nil {
 		return failTask(s, src, tr, "列表页抓取失败: "+err.Error())
@@ -826,9 +1100,394 @@ func trunc(s string, n int) string {
 
 var store *Store
 
+// ===================== wechat2rss 集成 =====================
+
+// W2RConfig 通过环境变量配置：
+//   W2R_BASE  = wechat2rss 服务地址，如 http://127.0.0.1:8090
+//   W2R_TOKEN = wechat2rss 的 RSS_TOKEN
+// 缺失时相关接口返回 503。
+type W2RConfig struct {
+	Base  string
+	Token string
+}
+
+var w2rConfig W2RConfig
+
+func loadW2RConfig() {
+	w2rConfig.Base = strings.TrimRight(os.Getenv("W2R_BASE"), "/")
+	w2rConfig.Token = os.Getenv("W2R_TOKEN")
+	if w2rConfig.Base == "" {
+		log.Printf("[w2r] W2R_BASE 未设置，公众号订阅模块将以未配置态运行")
+	} else {
+		log.Printf("[w2r] wechat2rss 代理已启用: %s", w2rConfig.Base)
+	}
+}
+
+func w2rReady() bool { return w2rConfig.Base != "" }
+
+// w2rURL 把路径 + 额外 query 拼成完整 URL，token 自动加到 query 里
+func w2rURL(path string, extra url.Values) string {
+	if extra == nil {
+		extra = url.Values{}
+	}
+	if w2rConfig.Token != "" {
+		extra.Set("k", w2rConfig.Token)
+	}
+	q := extra.Encode()
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return w2rConfig.Base + path + sep + q
+}
+
+// w2rRequest 透传调用 wechat2rss。method=GET/POST；body 为可选。
+// 返回 wechat2rss 的原始响应 body 与 status code。
+func w2rRequest(method, path string, extra url.Values, body io.Reader, cookies []*http.Cookie) ([]byte, int, []*http.Cookie, error) {
+	req, err := http.NewRequest(method, w2rURL(path, extra), body)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	req.Header.Set("User-Agent", "DZB-InfoTracker/1.0 w2r-proxy")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	c := &http.Client{Timeout: 20 * time.Second}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	return b, resp.StatusCode, resp.Cookies(), err
+}
+
+// 把 cookie list 转成 "K=V; K=V" 形式回写到浏览器（仅扫码登录会用）
+func cookiesToHeader(cs []*http.Cookie) string {
+	parts := []string{}
+	for _, c := range cs {
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// 把请求里的 Cookie header 解析出来透传给 wechat2rss
+func reqCookies(r *http.Request) []*http.Cookie { return r.Cookies() }
+
+// w2rNotReady 标准化的 503 响应
+func w2rNotReady(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(`{"err":"wechat2rss 未配置，请管理员设置 W2R_BASE / W2R_TOKEN 环境变量"}`))
+}
+
+// w2rProxy 通用代理：把 wechat2rss 的原始 JSON 透传回去（保留状态码与 cookie）
+func w2rProxy(w http.ResponseWriter, r *http.Request, method, path string, extra url.Values, body io.Reader) {
+	if !w2rReady() {
+		w2rNotReady(w)
+		return
+	}
+	respBody, code, cookies, err := w2rRequest(method, path, extra, body, reqCookies(r))
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"err":"wechat2rss 请求失败: %s"}`, escapeJSON(err.Error()))
+		return
+	}
+	for _, c := range cookies {
+		http.SetCookie(w, &http.Cookie{Name: c.Name, Value: c.Value, Path: c.Path, MaxAge: c.MaxAge})
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_, _ = w.Write(respBody)
+}
+
+func escapeJSON(s string) string {
+	b, _ := json.Marshal(s)
+	if len(b) >= 2 {
+		return string(b[1 : len(b)-1])
+	}
+	return s
+}
+
+// ----- 各 /api/w2r/* 接口 -----
+
+func apiW2RHealth(w http.ResponseWriter, r *http.Request) {
+	out := map[string]interface{}{
+		"ready":     w2rReady(),
+		"base":      w2rConfig.Base,
+		"has_token": w2rConfig.Token != "",
+	}
+	if !w2rReady() {
+		writeJSON(w, out)
+		return
+	}
+	body, code, _, err := w2rRequest("GET", "/version", nil, nil, nil)
+	if err != nil {
+		out["online"] = false
+		out["error"] = err.Error()
+	} else {
+		out["online"] = code >= 200 && code < 300
+		out["version"] = strings.TrimSpace(string(body))
+	}
+	writeJSON(w, out)
+}
+
+func apiW2RAccounts(w http.ResponseWriter, r *http.Request) {
+	w2rProxy(w, r, "GET", "/login/list", nil, nil)
+}
+
+func apiW2RAccountLogin(w http.ResponseWriter, r *http.Request) {
+	w2rProxy(w, r, "GET", "/login/new", nil, nil)
+}
+
+func apiW2RAccountCode(w http.ResponseWriter, r *http.Request) {
+	w2rProxy(w, r, "POST", "/login/code", nil, r.Body)
+}
+
+func apiW2RAccountRefresh(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "id required", 400)
+		return
+	}
+	w2rProxy(w, r, "GET", "/login/refresh/"+id, nil, nil)
+}
+
+func apiW2RAccountDel(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "id required", 400)
+		return
+	}
+	w2rProxy(w, r, "GET", "/login/del/"+id, nil, nil)
+}
+
+func apiW2RFeeds(w http.ResponseWriter, r *http.Request) {
+	q := url.Values{}
+	if v := r.URL.Query().Get("page"); v != "" {
+		q.Set("page", v)
+	}
+	if v := r.URL.Query().Get("size"); v != "" {
+		q.Set("size", v)
+	} else {
+		q.Set("size", "200")
+	}
+	if v := r.URL.Query().Get("name"); v != "" {
+		q.Set("name", v)
+	}
+	w2rProxy(w, r, "GET", "/list", q, nil)
+}
+
+func apiW2RFeedAddURL(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		URL string `json:"url"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if in.URL == "" {
+		http.Error(w, "url required", 400)
+		return
+	}
+	q := url.Values{}
+	q.Set("url", in.URL)
+	w2rProxy(w, r, "GET", "/addurl", q, nil)
+}
+
+func apiW2RFeedAddID(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID string `json:"id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if in.ID == "" {
+		http.Error(w, "id required", 400)
+		return
+	}
+	w2rProxy(w, r, "GET", "/add/"+in.ID, nil, nil)
+}
+
+func apiW2RFeedDel(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID string `json:"id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if in.ID == "" {
+		http.Error(w, "id required", 400)
+		return
+	}
+	w2rProxy(w, r, "GET", "/del/"+in.ID, nil, nil)
+}
+
+func apiW2RFeedPause(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID     string `json:"id"`
+		Status bool   `json:"status"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if in.ID == "" {
+		http.Error(w, "id required", 400)
+		return
+	}
+	q := url.Values{}
+	if in.Status {
+		q.Set("status", "true")
+	} else {
+		q.Set("status", "false")
+	}
+	w2rProxy(w, r, "GET", "/pause/"+in.ID, q, nil)
+}
+
+// rewriteFeedLink 把 wechat2rss 返回的 feed link 改写为可被本机访问的 127.0.0.1
+// 因为 .env 里 RSS_HOST 通常配的是局域网 IP，从 macOS 上反向连不通。
+func rewriteFeedLink(link string) string {
+	u, err := url.Parse(link)
+	if err != nil || u.Host == "" {
+		return link
+	}
+	// 只重写 host，端口保留
+	host := u.Host
+	if i := strings.Index(host, ":"); i >= 0 {
+		u.Host = "127.0.0.1" + host[i:]
+	} else {
+		u.Host = "127.0.0.1"
+	}
+	return u.String()
+}
+
+// apiW2RFeedsSync 把 wechat2rss 的全部订阅同步成 本系统 Source
+// 支持 ?dry=1 预览，POST body 可传 {ids:[...]} 限定要导入的 ids
+func apiW2RFeedsSync(w http.ResponseWriter, r *http.Request) {
+	if !w2rReady() {
+		w2rNotReady(w)
+		return
+	}
+	body, code, _, err := w2rRequest("GET", "/list", url.Values{"size": []string{"500"}}, nil, nil)
+	if err != nil || code >= 400 {
+		writeJSON(w, map[string]interface{}{"err": fmt.Sprintf("拉取 wechat2rss /list 失败: %v / HTTP %d", err, code)})
+		return
+	}
+	var listResp struct {
+		Data []struct {
+			ID     json.Number `json:"id"`
+			Name   string      `json:"name"`
+			Link   string      `json:"link"`
+			Paused bool        `json:"paused"`
+		} `json:"data"`
+		Err string `json:"err"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&listResp); err != nil {
+		writeJSON(w, map[string]interface{}{"err": "解析 wechat2rss 响应失败: " + err.Error()})
+		return
+	}
+	if listResp.Err != "" {
+		writeJSON(w, map[string]interface{}{"err": listResp.Err})
+		return
+	}
+
+	dry := r.URL.Query().Get("dry") == "1"
+	// 可选：从 body 里读 ids 白名单
+	wantIDs := map[string]bool{}
+	if r.Method == "POST" {
+		var in struct {
+			IDs []string `json:"ids"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		for _, id := range in.IDs {
+			wantIDs[id] = true
+		}
+	}
+
+	// 已存在 url
+	store.mu.RLock()
+	existsURL := map[string]bool{}
+	for _, s := range store.Sources {
+		existsURL[s.URL] = true
+	}
+	store.mu.RUnlock()
+
+	type item struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Link   string `json:"link"`
+		Paused bool   `json:"paused"`
+		Status string `json:"status"` // new / exists / skipped
+	}
+	items := []item{}
+	for _, it := range listResp.Data {
+		idStr := it.ID.String()
+		if len(wantIDs) > 0 && !wantIDs[idStr] {
+			continue
+		}
+		link := rewriteFeedLink(it.Link)
+		it2 := item{ID: idStr, Name: it.Name, Link: link, Paused: it.Paused}
+		if existsURL[link] {
+			it2.Status = "exists"
+		} else {
+			it2.Status = "new"
+		}
+		items = append(items, it2)
+	}
+
+	if dry {
+		writeJSON(w, map[string]interface{}{"items": items, "dry": true})
+		return
+	}
+
+	// 真正写入
+	store.mu.Lock()
+	created, skipped := 0, 0
+	now := time.Now()
+	for _, it := range items {
+		if it.Status == "exists" {
+			skipped++
+			continue
+		}
+		s := Source{
+			Unit:       it.Name + " [公众号]",
+			Type:       "wechat2rss",
+			Kind:       "rss",
+			Category:   `企业类`,
+			URL:        it.Link,
+			Frequency:  "daily",
+			OwnerName:  `王干事`,
+			Group:      `招商组`,
+			Active:     !it.Paused,
+			Authorized: true,
+			ID:         store.nextID("source"),
+			CreatedAt:  now,
+		}
+		store.Sources = append(store.Sources, s)
+		created++
+	}
+	store.mu.Unlock()
+	store.save()
+
+	writeJSON(w, map[string]interface{}{
+		"items":   items,
+		"created": created,
+		"skipped": skipped,
+		"total":   len(items),
+	})
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	store = loadStore()
+	loadW2RConfig()
+
+	// 报告采集微服务状态
+	if crawlerHealth() {
+		log.Printf("[crawler] 通用采集微服务在线: %s (crawl4ai)", crawlerBase)
+	} else {
+		log.Printf("[crawler] 通用采集微服务未启动 (%s)，将降级到正则解析", crawlerBase)
+	}
+
+	// 启动后台调度：每分钟扫一次，按 frequency 到期的源串行执行
+	go schedulerLoop()
 
 	sub, _ := fs.Sub(assets, "static")
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
@@ -838,6 +1497,8 @@ func main() {
 	http.HandleFunc("/api/sources/create", apiSourceCreate)
 	http.HandleFunc("/api/sources/bulk_import", apiSourceBulkImport)
 	http.HandleFunc("/api/sources/toggle", apiSourceToggle)
+	http.HandleFunc("/api/sources/delete", apiSourceDelete)
+	http.HandleFunc("/api/sources/test", apiSourceTest)
 	http.HandleFunc("/api/articles", apiArticles)
 	http.HandleFunc("/api/article", apiArticleDetail)
 	http.HandleFunc("/api/article/update", apiArticleUpdate)
@@ -849,8 +1510,24 @@ func main() {
 	http.HandleFunc("/api/briefs", apiBriefs)
 	http.HandleFunc("/api/briefs/generate", apiBriefGenerate)
 	http.HandleFunc("/api/briefs/publish", apiBriefPublish)
+	http.HandleFunc("/api/briefs/export", apiBriefExport)
 	http.HandleFunc("/api/pushes", apiPushes)
 	http.HandleFunc("/api/tasks", apiTasks)
+	http.HandleFunc("/api/demo/full", apiDemoFull)
+
+	// ---- wechat2rss 集成 ----
+	http.HandleFunc("/api/w2r/health", apiW2RHealth)
+	http.HandleFunc("/api/w2r/accounts", apiW2RAccounts)
+	http.HandleFunc("/api/w2r/accounts/login", apiW2RAccountLogin)
+	http.HandleFunc("/api/w2r/accounts/code", apiW2RAccountCode)
+	http.HandleFunc("/api/w2r/accounts/refresh", apiW2RAccountRefresh)
+	http.HandleFunc("/api/w2r/accounts/del", apiW2RAccountDel)
+	http.HandleFunc("/api/w2r/feeds", apiW2RFeeds)
+	http.HandleFunc("/api/w2r/feeds/add_url", apiW2RFeedAddURL)
+	http.HandleFunc("/api/w2r/feeds/add_id", apiW2RFeedAddID)
+	http.HandleFunc("/api/w2r/feeds/del", apiW2RFeedDel)
+	http.HandleFunc("/api/w2r/feeds/pause", apiW2RFeedPause)
+	http.HandleFunc("/api/w2r/feeds/sync", apiW2RFeedsSync)
 
 	indexHTML, err := assets.ReadFile("index.html")
 	if err != nil {
@@ -972,6 +1649,167 @@ func apiSourceToggle(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"ok": "1"})
 }
 
+// apiSourceDelete 删除一个信息源。文章本身不删（保留历史记录）。
+func apiSourceDelete(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+	store.mu.Lock()
+	idx := -1
+	for i := range store.Sources {
+		if store.Sources[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		store.Sources = append(store.Sources[:idx], store.Sources[idx+1:]...)
+	}
+	store.mu.Unlock()
+	store.save()
+	if idx < 0 {
+		http.Error(w, "not found", 404)
+		return
+	}
+	writeJSON(w, map[string]string{"ok": "1"})
+}
+
+// apiSourceTest 测试采集一个 URL，返回预览结果，不入库。
+// POST /api/sources/test  {"url": "...", "type": "website|rss"}
+func apiSourceTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var in struct {
+		URL  string `json:"url"`
+		Type string `json:"type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if in.URL == "" {
+		http.Error(w, "url required", 400)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sourceType := in.Type
+	if sourceType == "" {
+		sourceType = "website"
+	}
+
+	// RSS 类型直接走 RSS 解析测试
+	if sourceType == "rss" || sourceType == "wechat2rss" {
+		body, err := httpGet(ctx, in.URL)
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "RSS 抓取失败: " + err.Error()})
+			return
+		}
+		items, err := parseFeed(body)
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "RSS 解析失败: " + err.Error()})
+			return
+		}
+		preview := []map[string]string{}
+		for i, it := range items {
+			if i >= 3 {
+				break
+			}
+			preview = append(preview, map[string]string{
+				"title": it.Title, "url": it.URL,
+				"publish_time": func() string {
+					if !it.Published.IsZero() {
+						return it.Published.Format("2006-01-02 15:04")
+					}
+					return ""
+				}(),
+			})
+		}
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "mode": "rss", "found": len(items),
+			"preview": preview, "engine": "go-rss",
+		})
+		return
+	}
+
+	// 网站类型：优先走 crawl4ai 微服务
+	if crawlerHealth() {
+		listRes, err := crawlerList(ctx, in.URL, 15)
+		if err != nil || !listRes.OK {
+			errMsg := "微服务调用失败"
+			if err != nil {
+				errMsg = err.Error()
+			} else if listRes != nil {
+				errMsg = listRes.Error
+			}
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "crawler: " + errMsg, "engine": "crawl4ai"})
+			return
+		}
+		preview := []map[string]string{}
+		var firstDetail *crawlerDetailResult
+		for i, it := range listRes.Items {
+			if i >= 3 {
+				break
+			}
+			preview = append(preview, map[string]string{
+				"title": it.Title, "url": it.URL, "publish_time": it.PublishTime,
+			})
+		}
+		// 对第 1 条试抓详情
+		if len(listRes.Items) > 0 {
+			d, err := crawlerDetail(ctx, listRes.Items[0].URL)
+			if err == nil {
+				firstDetail = d
+			}
+		}
+		detailPreview := map[string]interface{}{}
+		if firstDetail != nil {
+			detailPreview = map[string]interface{}{
+				"ok":          firstDetail.OK,
+				"title":       firstDetail.Title,
+				"content_len": len([]rune(firstDetail.ContentText)),
+				"excerpt":     trunc(firstDetail.ContentText, 200),
+				"publish_time": firstDetail.PublishTime,
+			}
+		}
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "mode": "list", "found": len(listRes.Items),
+			"preview": preview, "detail": detailPreview,
+			"engine": "crawl4ai",
+		})
+		return
+	}
+
+	// 降级：原正则解析
+	listHTML, err := httpGet(ctx, in.URL)
+	if err != nil {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "抓取失败: " + err.Error(), "engine": "regex-fallback"})
+		return
+	}
+	items := parseListPage(in.URL, listHTML)
+	preview := []map[string]string{}
+	for i, it := range items {
+		if i >= 3 {
+			break
+		}
+		preview = append(preview, map[string]string{
+			"title": it.Title, "url": it.URL,
+			"publish_time": func() string {
+				if !it.Published.IsZero() {
+					return it.Published.Format("2006-01-02 15:04")
+				}
+				return ""
+			}(),
+		})
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok": len(items) > 0, "mode": "list", "found": len(items),
+		"preview": preview, "engine": "regex-fallback",
+		"warning": "采集微服务未启动，使用降级正则解析（泛化能力有限）",
+	})
+}
+
 // apiSourceBulkImport 批量导入信息源
 // POST /api/sources/bulk_import
 // body: { "items": [{unit,type,kind,category,url,owner_name,group,frequency}, ...] }
@@ -1001,7 +1839,7 @@ func apiSourceBulkImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if s.Kind == "" {
-			if s.Type == "rss" || s.Type == "wewe-rss" || s.Type == "wechat2rss" {
+			if s.Type == "rss" || s.Type == "wechat2rss" {
 				s.Kind = "rss"
 			} else {
 				s.Kind = "html_list"
@@ -1047,7 +1885,33 @@ func apiArticles(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, a)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].FetchTime.After(out[j].FetchTime) })
+	// 排序：重要性（高→中→低）优先，同等重要性下按发布时间倒序
+	impRank := func(s string) int {
+		switch s {
+		case "高":
+			return 3
+		case "中":
+			return 2
+		case "低":
+			return 1
+		}
+		return 0
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ri, rj := impRank(out[i].Importance), impRank(out[j].Importance)
+		if ri != rj {
+			return ri > rj
+		}
+		// 同等重要性：按发布时间倒序；若无发布时间则按入库时间
+		ti, tj := out[i].PublishTime, out[j].PublishTime
+		if ti.IsZero() {
+			ti = out[i].FetchTime
+		}
+		if tj.IsZero() {
+			tj = out[j].FetchTime
+		}
+		return ti.After(tj)
+	})
 	writeJSON(w, out)
 }
 
@@ -1364,10 +2228,7 @@ func apiBriefPublish(w http.ResponseWriter, r *http.Request) {
 				Subject: store.Briefs[i].Title, BriefID: id,
 				Status: "success", ReturnCode: "0", OccurredAt: time.Now(),
 			}
-			if rand.Intn(20) == 0 {
-				pl.Status = "fail"
-				pl.ReturnCode = "60001"
-			}
+			// Demo: 不模拟随机失败，保证演示链路稳定
 			store.Pushes = append(store.Pushes, pl)
 			store.mu.Unlock()
 			store.save()
@@ -1398,4 +2259,312 @@ func apiTasks(w http.ResponseWriter, r *http.Request) {
 		out = out[:100]
 	}
 	writeJSON(w, out)
+}
+
+// ===================== 演示用：一键完整闭环 =====================
+// /api/demo/full —— 演示给客户：采集 → AI → 审核（自动通过 top 高重要性）→ 生成日报 → 推送
+// 返回每一步的概要，便于前端按步骤显示。
+type demoStep struct {
+	Step    int    `json:"step"`
+	Name    string `json:"name"`
+	OK      bool   `json:"ok"`
+	Summary string `json:"summary"`
+}
+type demoResult struct {
+	Steps []demoStep `json:"steps"`
+}
+
+func apiDemoFull(w http.ResponseWriter, r *http.Request) {
+	out := demoResult{}
+	add := func(step int, name string, ok bool, summary string) {
+		out.Steps = append(out.Steps, demoStep{step, name, ok, summary})
+	}
+
+	// 1) 全量采集
+	store.mu.Lock()
+	collectResults := []TaskRun{}
+	for i := range store.Sources {
+		if !store.Sources[i].Active {
+			continue
+		}
+		tr := runOneCollect(store, &store.Sources[i])
+		store.Tasks = append(store.Tasks, tr)
+		collectResults = append(collectResults, tr)
+	}
+	store.mu.Unlock()
+	store.save()
+	okCount, newTotal := 0, 0
+	for _, t := range collectResults {
+		if t.Status == "success" {
+			okCount++
+		}
+		newTotal += t.NewItems
+	}
+	add(1, "全量采集", true, fmt.Sprintf("%d 个信息源，%d 成功，新增 %d 篇", len(collectResults), okCount, newTotal))
+
+	// 2) AI 整理（对所有 collected 状态文章）
+	store.mu.Lock()
+	aiCount := 0
+	for i := range store.Articles {
+		if store.Articles[i].Status == "collected" {
+			runOneAI(&store.Articles[i])
+			aiCount++
+		}
+	}
+	store.mu.Unlock()
+	store.save()
+	add(2, "AI 智能整理", true, fmt.Sprintf("摘要 / 关键词 / 主题 / 重要性识别，共处理 %d 篇", aiCount))
+
+	// 3) 自动审核通过：取近 7 天「高/中重要性」最多 8 条
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	store.mu.Lock()
+	type cand struct {
+		idx int
+		t   time.Time
+	}
+	cands := []cand{}
+	for i, a := range store.Articles {
+		if a.Status != "pending_review" {
+			continue
+		}
+		if a.Importance != "高" && a.Importance != "中" {
+			continue
+		}
+		pt := a.PublishTime
+		if pt.IsZero() {
+			pt = a.FetchTime
+		}
+		if pt.Before(cutoff) {
+			continue
+		}
+		cands = append(cands, cand{i, pt})
+	}
+	// 倒序时间挑前 8 条
+	sort.Slice(cands, func(i, j int) bool { return cands[i].t.After(cands[j].t) })
+	approved := 0
+	for _, c := range cands {
+		if approved >= 8 {
+			break
+		}
+		store.Articles[c.idx].Status = "approved"
+		store.Reviews = append(store.Reviews, ReviewLog{
+			ID: store.nextID("review"), ArticleID: store.Articles[c.idx].ID,
+			Reviewer: `李审核`, Action: "approve",
+			Note: `[演示] 系统自动审核通过`, OccurredAt: time.Now(),
+		})
+		approved++
+	}
+	store.mu.Unlock()
+	store.save()
+	add(3, "人工审核", true, fmt.Sprintf("近 7 天高/中重要性条目，已通过 %d 条（演示自动）", approved))
+
+	// 4) 生成日报
+	now := time.Now()
+	store.mu.Lock()
+	ids := []int{}
+	cutBrief := now.Add(-7 * 24 * time.Hour)
+	for _, a := range store.Articles {
+		if a.PublishTime.Before(cutBrief) {
+			continue
+		}
+		if a.Status != "approved" && a.Status != "published" {
+			continue
+		}
+		if a.DuplicateOf > 0 {
+			continue
+		}
+		ids = append(ids, a.ID)
+	}
+	brief := Brief{
+		ID: store.nextID("brief"), Type: "daily",
+		Period:     now.Format("2006-01-02"),
+		Title:      briefTitle("daily", now.Format("2006-01-02")),
+		Status:     "draft",
+		ArticleIDs: ids,
+		Editor:     `李审核`,
+		CreatedAt:  now,
+	}
+	store.Briefs = append(store.Briefs, brief)
+	briefID := brief.ID
+	store.mu.Unlock()
+	store.save()
+	add(4, "生成日报", len(ids) > 0, fmt.Sprintf("「%s」 共 %d 条入选", brief.Title, len(ids)))
+
+	// 5) 推送（模拟企微）
+	store.mu.Lock()
+	for i := range store.Briefs {
+		if store.Briefs[i].ID == briefID {
+			store.Briefs[i].Status = "published"
+			store.Briefs[i].PublishedAt = time.Now()
+			for _, aid := range store.Briefs[i].ArticleIDs {
+				for j := range store.Articles {
+					if store.Articles[j].ID == aid && store.Articles[j].Status == "approved" {
+						store.Articles[j].Status = "published"
+					}
+				}
+			}
+			pl := PushLog{
+				ID: store.nextID("push"), Channel: "app", Target: `张主任`,
+				Subject: store.Briefs[i].Title, BriefID: briefID,
+				Status: "success", ReturnCode: "0", OccurredAt: time.Now(),
+			}
+			store.Pushes = append(store.Pushes, pl)
+			break
+		}
+	}
+	store.mu.Unlock()
+	store.save()
+	add(5, "企微推送", true, "已通过「应用消息」推送给张主任，返回码 0")
+
+	writeJSON(w, out)
+}
+
+// ===================== 简报导出 Word (.docx) =====================
+// 极简 docx：纯 zip 容器 + 几个固定 XML。仅依赖标准库。
+func apiBriefExport(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+	store.mu.RLock()
+	var brief *Brief
+	for i := range store.Briefs {
+		if store.Briefs[i].ID == id {
+			brief = &store.Briefs[i]
+			break
+		}
+	}
+	if brief == nil {
+		store.mu.RUnlock()
+		http.Error(w, "not found", 404)
+		return
+	}
+	// 收集条目
+	type briefItem = struct {
+		Importance, Unit, Title, LeaderSummary, URL string
+	}
+	items := []briefItem{}
+	for _, aid := range brief.ArticleIDs {
+		for _, a := range store.Articles {
+			if a.ID == aid {
+				items = append(items, briefItem{a.Importance, a.Unit, a.Title, a.LeaderSummary, a.URL})
+				break
+			}
+		}
+	}
+	title := brief.Title
+	period := brief.Period
+	editor := brief.Editor
+	store.mu.RUnlock()
+
+	// 按重要性排序
+	sort.SliceStable(items, func(i, j int) bool {
+		rank := map[string]int{"高": 3, "中": 2, "低": 1}
+		return rank[items[i].Importance] > rank[items[j].Importance]
+	})
+
+	// 生成 docx —— 简单结构：[Content_Types].xml / _rels/.rels / word/document.xml
+	docXML := buildDocxBody(title, period, editor, items)
+	docxBytes, err := zipDocx(docXML)
+	if err != nil {
+		http.Error(w, "export failed: "+err.Error(), 500)
+		return
+	}
+	filename := fmt.Sprintf("%s.docx", strings.ReplaceAll(title, " ", "_"))
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+url.PathEscape(filename)+`"`)
+	_, _ = w.Write(docxBytes)
+}
+
+func buildDocxBody(title, period, editor string, items []struct {
+	Importance, Unit, Title, LeaderSummary, URL string
+}) string {
+	esc := func(s string) string {
+		s = strings.ReplaceAll(s, "&", "&amp;")
+		s = strings.ReplaceAll(s, "<", "&lt;")
+		s = strings.ReplaceAll(s, ">", "&gt;")
+		return s
+	}
+	p := func(text string, opts ...string) string {
+		var pPr, rPr string
+		for _, o := range opts {
+			switch o {
+			case "title":
+				pPr = `<w:pPr><w:jc w:val="center"/></w:pPr>`
+				rPr = `<w:rPr><w:b/><w:sz w:val="36"/><w:color w:val="B32424"/></w:rPr>`
+			case "h2":
+				rPr = `<w:rPr><w:b/><w:sz w:val="26"/><w:color w:val="8C1C1C"/></w:rPr>`
+			case "meta":
+				rPr = `<w:rPr><w:color w:val="6B7280"/><w:sz w:val="20"/></w:rPr>`
+			case "bold":
+				rPr = `<w:rPr><w:b/></w:rPr>`
+			}
+		}
+		return "<w:p>" + pPr + "<w:r>" + rPr + "<w:t xml:space=\"preserve\">" + esc(text) + "</w:t></w:r></w:p>"
+	}
+
+	body := p(title, "title")
+	body += p("期次："+period+"     编辑："+editor+"     生成时间："+time.Now().Format("2006-01-02 15:04"), "meta")
+	body += p("", "")
+	body += p("一、要点摘要", "h2")
+	highCount, midCount := 0, 0
+	for _, it := range items {
+		if it.Importance == "高" {
+			highCount++
+		} else if it.Importance == "中" {
+			midCount++
+		}
+	}
+	body += p(fmt.Sprintf("本期共收录 %d 条信息，其中高重要性 %d 条，中重要性 %d 条。", len(items), highCount, midCount))
+	body += p("", "")
+	body += p("二、条目正文", "h2")
+	for i, it := range items {
+		body += p(fmt.Sprintf("%d.【%s】%s", i+1, it.Importance, it.Title), "bold")
+		body += p("来源："+it.Unit, "meta")
+		if it.LeaderSummary != "" {
+			body += p("摘要：" + it.LeaderSummary)
+		}
+		if it.URL != "" {
+			body += p("原文链接：" + it.URL, "meta")
+		}
+		body += p("", "")
+	}
+
+	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>` + body + `</w:body></w:document>`
+}
+
+func zipDocx(documentXML string) ([]byte, error) {
+	contentTypes := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`
+	rootRels := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	add := func(name, content string) error {
+		f, err := zw.Create(name)
+		if err != nil {
+			return err
+		}
+		_, err = f.Write([]byte(content))
+		return err
+	}
+	if err := add("[Content_Types].xml", contentTypes); err != nil {
+		return nil, err
+	}
+	if err := add("_rels/.rels", rootRels); err != nil {
+		return nil, err
+	}
+	if err := add("word/document.xml", documentXML); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

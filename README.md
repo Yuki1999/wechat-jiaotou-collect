@@ -1,7 +1,7 @@
 # 党政办信息跟踪与智能整理系统 · Demo
 
 > 面向党政办的"信息源 → 自动采集 → AI 整理 → 人工审核 → 简报 → 企微推送"闭环 Demo
-> 已接入**真实数据源**：苏州工业园区管委会官网 + 通用 RSS / WeWe RSS 适配
+> 已接入**真实数据源**：苏州工业园区管委会官网 + 通用 RSS / wechat2rss 适配
 
 ## 技术栈
 
@@ -10,7 +10,7 @@
 - **存储**：内存 + JSON 落盘 (`data.json`)
 - **采集器**：
   - `html_list` — 通用列表+详情页 HTML 抓取（已对苏州工业园区站点适配 `<meta ArticleTitle>` / `id="zoomcon"`）
-  - `rss` — 标准 RSS 2.0 / Atom，**与 WeWe RSS 直接兼容**
+  - `rss` — 标准 RSS 2.0 / Atom，**与 wechat2rss 直接兼容**
 - **AI 整理**：规则引擎（关键词字典 + 主题映射 + 重要性判定 + 首句摘要 + 置信度）
 
 ## 快速开始
@@ -24,39 +24,47 @@ go run .
 
 ## 接入微信公众号（以"苏州工业园区发布"为例）
 
-WeWe RSS 是把任意微信公众号转为标准 RSS 的开源工具。本系统的 RSS 适配器与它直接兼容。
+本系统通过 **wechat2rss**（付费私有部署）把任意微信公众号转为标准 RSS。本仓库 `deploy/wechat2rss/` 已经提供完整的部署脚本与运维文档。
 
-### 1. 部署 WeWe RSS
+### 1. 部署 wechat2rss
 
 ```bash
-docker run -d --name wewe-rss \
-  -p 4000:4000 \
-  -v $PWD/wewe-data:/app/data \
-  -e DATABASE_TYPE=sqlite \
-  -e SERVER_ORIGIN_URL=http://127.0.0.1:4000 \
-  ghcr.io/cooderl/wewe-rss-sqlite:latest
+cd deploy/wechat2rss
+cp .env.example .env
+# 编辑 .env，填入 LIC_EMAIL / LIC_CODE / RSS_HOST / RSS_TOKEN
+# 端口建议设为 8090，避开党政办系统占用的 8080
+./deploy.sh up
 ```
 
-### 2. 在 WeWe RSS 控制台添加公众号
+> 完整的部署/订阅/排错手册见 [`deploy/wechat2rss/README.md`](deploy/wechat2rss/README.md)。
 
-打开 `http://127.0.0.1:4000`，按提示用 Mac 微信扫码登录（仅用于读取公众号文章列表），然后添加你想订阅的公众号——例如 *苏州工业园区发布*、*园区科技*、*园区招商* 等。WeWe RSS 会给出每个公众号的 feed URL，形如：
+### 2. 在 wechat2rss 控制台添加公众号
+
+浏览器打开 `http://<RSS_HOST>`（如 `http://192.168.0.130:8090`），密码为 `.env` 中的 `RSS_TOKEN`。
+
+- 控制台 → 账号管理 → 用**专用小号**扫码登录（仅用于读取公众号文章，**不要用主号**）
+- 任意复制一篇目标公众号的文章链接（形如 `https://mp.weixin.qq.com/s/xxxxx`），粘贴到控制台 → 订阅
+
+控制台会返回该公众号的 feed URL，形如：
 
 ```
-http://127.0.0.1:4000/feeds/MP_WXS_xxxxxxxx.rss
+http://192.168.0.130:8090/feed/<sha1>.xml
 ```
 
 ### 3. 在本系统添加 RSS 信息源
 
-在 Demo 的 **信息源管理 → 新增信息源** 中：
+**方式一**：在 Demo 的 **信息源管理 → 新增信息源** 中：
 
 | 字段 | 填什么 |
 |---|---|
 | 单位名称 | `苏州工业园区发布`（或对应公众号名） |
-| 类型 | `WeWe RSS（公众号→RSS）` |
+| 类型 | `wechat2rss（公众号→RSS）` |
 | 入口地址 | 上一步得到的 feed URL |
 | 责任人 / 组 / 频率 | 按业务填 |
 
 点保存 → 点"采集" → 真实公众号文章就进入系统了。
+
+**方式二**（推荐，批量）：用 `deploy/wechat2rss/import-to-dzb.sh` 一键把 wechat2rss 上所有已订阅公众号全部同步进党政办系统。重复 URL 自动跳过。
 
 ## 项目结构
 
@@ -78,7 +86,7 @@ http://127.0.0.1:4000/feeds/MP_WXS_xxxxxxxx.rss
 | 路由 | 模块 | 关键交互 |
 |---|---|---|
 | `/` | 工作台 | 实时统计、一键演示流程、最近任务、待审核 |
-| `/sources` | 信息源管理 | HTML / RSS / WeWe RSS；启停、单源采集、全量采集 |
+| `/sources` | 信息源管理 | HTML / RSS / wechat2rss；启停、单源采集、全量采集 |
 | `/tasks` | 采集任务 | 任务历史、耗时、错误码 |
 | `/review` | 审核工作台 | 双栏列表+编辑器；AI 摘要可改、通过/退回 |
 | `/briefs` | 简报管理 | 日报/周报/月报生成 + 一键发布企微 |
@@ -104,4 +112,4 @@ http://127.0.0.1:4000/feeds/MP_WXS_xxxxxxxx.rss
 
 - "政声传递"栏目列表为 JS 动态加载，静态抓取拿不到，已默认停用（如需可改用 headless browser）。
 - 本 Demo 的"企微推送"为模拟实现，正式接入需企业管理员授权 corpId / agentId / secret。
-- WeWe RSS 走的是 Mac 微信扫码授权，不绕过任何官方机制；账号有被风控风险，请用专门账号且控制频率。
+- wechat2rss 通过授权微信号 + 微信读书官方接口拉取公众号文章；账号有被风控风险，请用专门小号且控制频率。
