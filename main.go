@@ -75,6 +75,7 @@ type Article struct {
 	Keywords      []string  `json:"keywords"`
 	Topics        []string  `json:"topics"`
 	Confidence    float64   `json:"confidence"`
+	AIEngine      string    `json:"ai_engine"` // deepseek-v4-pro / rule / ""
 	Evidence      string    `json:"evidence"`
 	DuplicateOf   int       `json:"duplicate_of,omitempty"`
 	OwnerID       int       `json:"owner_id"`
@@ -997,11 +998,198 @@ func failTask(s *Store, src *Source, tr TaskRun, msg string) TaskRun {
 	return tr
 }
 
+// ===================== AI 整理 =====================
+
+// DeepSeek 配置（通过环境变量传入）：
+//   DEEPSEEK_API_KEY  必填，签发于 platform.deepseek.com
+//   DEEPSEEK_MODEL    可选，默认 deepseek-v4-pro
+//   DEEPSEEK_BASE     可选，默认 https://api.deepseek.com
+// 未配置 key 时所有调用自动降级到本地规则引擎。
+var (
+	deepseekKey   = ""
+	deepseekModel = "deepseek-v4-pro"
+	deepseekBase  = "https://api.deepseek.com"
+)
+
+func loadAIConfig() {
+	deepseekKey = strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
+	if v := strings.TrimSpace(os.Getenv("DEEPSEEK_MODEL")); v != "" {
+		deepseekModel = v
+	}
+	if v := strings.TrimSpace(os.Getenv("DEEPSEEK_BASE")); v != "" {
+		deepseekBase = strings.TrimRight(v, "/")
+	}
+	if deepseekKey == "" {
+		log.Printf("[ai] DEEPSEEK_API_KEY 未设置，AI 整理将使用本地规则引擎")
+	} else {
+		log.Printf("[ai] DeepSeek 已启用: model=%s base=%s", deepseekModel, deepseekBase)
+	}
+}
+
+// deepseekAIResult 期望大模型返回的 JSON 结构
+type deepseekAIResult struct {
+	Summary       string   `json:"summary"`
+	LeaderSummary string   `json:"leader_summary"`
+	DetailSummary string   `json:"detail_summary"`
+	Importance    string   `json:"importance"`
+	Category      string   `json:"category"`
+	Keywords      []string `json:"keywords"`
+}
+
+// runOneAI 主入口：优先调 DeepSeek（含 1 次重试），失败降级到本地规则。
+// 单文章处理，调用方负责并发控制。
 func runOneAI(a *Article) {
 	if len([]rune(a.Content)) < 30 {
 		a.Status = "failed"
 		return
 	}
+	if deepseekKey != "" {
+		var lastErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := runOneAIDeepSeek(a); err == nil {
+				a.AIEngine = deepseekModel
+				a.Status = "pending_review"
+				return
+			} else {
+				lastErr = err
+				// 第 1 次失败时短暂等待再重试（DeepSeek 偶发 empty content）
+				if attempt == 0 {
+					time.Sleep(1500 * time.Millisecond)
+				}
+			}
+		}
+		log.Printf("[ai] DeepSeek failed (after retry) for article id=%d: %v, falling back to rule", a.ID, lastErr)
+	}
+	runOneAIRule(a)
+	a.AIEngine = "rule"
+	a.Status = "pending_review"
+}
+
+// runOneAIDeepSeek 调 DeepSeek 一次拿全 6 个字段
+func runOneAIDeepSeek(a *Article) error {
+	// 截断超长正文，避免 token 爆炸
+	content := a.Content
+	if len([]rune(content)) > 3000 {
+		r := []rune(content)
+		content = string(r[:3000]) + "…"
+	}
+	prompt := fmt.Sprintf(`你是党政办的资深信息员，负责给主任简报整理内容。请阅读下面这篇文章，严格按 JSON 格式输出 6 个字段。
+
+判定标准：
+- 重要性=高：营商环境、重大项目、招商签约、专精特新、常委会决策、自贸区、生物医药、人工智能、领导调研部署
+- 重要性=中：推进会、印发文件、调研走访、专题检查
+- 重要性=低：常规活动、节日宣传、一般动态
+- 分类只能选 1 个：营商环境、招商引资、重点企业、产业创新、经济运行、民生关注、涉外开放、其他
+
+请只输出 JSON，字段：
+{
+  "summary": "一句话摘要，60 字内，给同事快速浏览",
+  "leader_summary": "领导阅览摘要，110 字内，给主任看",
+  "detail_summary": "详细摘要，200 字内，给上报材料用",
+  "importance": "高/中/低",
+  "category": "上述 8 类之一",
+  "keywords": ["关键词1", "关键词2", "最多6个"]
+}
+
+文章标题：%s
+单位：%s
+正文：%s`, a.Title, a.Unit, content)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"model": deepseekModel,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"response_format": map[string]string{"type": "json_object"},
+		"temperature":     0.3,
+		"max_tokens":      2000,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", deepseekBase+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+deepseekKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 35 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, trunc(string(respBody), 200))
+	}
+
+	var apiResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return fmt.Errorf("parse api response: %w", err)
+	}
+	if apiResp.Error.Message != "" {
+		return fmt.Errorf("api error: %s", apiResp.Error.Message)
+	}
+	if len(apiResp.Choices) == 0 {
+		return fmt.Errorf("empty choices")
+	}
+	raw := apiResp.Choices[0].Message.Content
+	if raw == "" {
+		return fmt.Errorf("empty content")
+	}
+
+	var r deepseekAIResult
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		// 部分模型会带 markdown 包裹，去掉 ```json ... ``` 再试
+		raw2 := strings.TrimSpace(raw)
+		raw2 = strings.TrimPrefix(raw2, "```json")
+		raw2 = strings.TrimPrefix(raw2, "```")
+		raw2 = strings.TrimSuffix(raw2, "```")
+		raw2 = strings.TrimSpace(raw2)
+		if err2 := json.Unmarshal([]byte(raw2), &r); err2 != nil {
+			return fmt.Errorf("parse json: %w (raw=%s)", err, trunc(raw, 200))
+		}
+	}
+
+	// 字段校验 + 装回文章
+	imp := strings.TrimSpace(r.Importance)
+	if imp != "高" && imp != "中" && imp != "低" {
+		imp = "中"
+	}
+	a.Importance = imp
+	a.Summary = trunc(strings.TrimSpace(r.Summary), 80)
+	a.LeaderSummary = trunc(strings.TrimSpace(r.LeaderSummary), 150)
+	a.DetailSummary = trunc(strings.TrimSpace(r.DetailSummary), 300)
+	a.Category = a.Category // 保留原 source 设置的 category
+	if r.Category != "" && r.Category != "其他" {
+		// 把 DeepSeek 识别的主题放进 topics（主题列表），不覆盖 source.Category 那个大类
+		a.Topics = []string{r.Category}
+	}
+	if len(r.Keywords) > 6 {
+		r.Keywords = r.Keywords[:6]
+	}
+	a.Keywords = r.Keywords
+	a.Evidence = fmt.Sprintf("由 %s 整理 · tokens=%d", deepseekModel, apiResp.Usage.TotalTokens)
+	a.Confidence = 0.95
+	return nil
+}
+
+// runOneAIRule 原本的本地规则引擎，作为兜底。
+func runOneAIRule(a *Article) {
 	keywords := extractKeywords(a.Title + " " + a.Content)
 	a.Keywords = keywords
 	imp := `低`
@@ -1055,7 +1243,7 @@ func runOneAI(a *Article) {
 			}
 		}
 	}
-	a.Status = "pending_review"
+	// status 由调用方 runOneAI 统一设置
 }
 
 func extractKeywords(text string) []string {
@@ -1478,6 +1666,7 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 	store = loadStore()
 	loadW2RConfig()
+	loadAIConfig()
 
 	// 报告采集微服务状态
 	if crawlerHealth() {
@@ -1493,6 +1682,7 @@ func main() {
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
 
 	http.HandleFunc("/api/stats", apiStats)
+	http.HandleFunc("/api/users", apiUsers)
 	http.HandleFunc("/api/sources", apiSources)
 	http.HandleFunc("/api/sources/create", apiSourceCreate)
 	http.HandleFunc("/api/sources/bulk_import", apiSourceBulkImport)
@@ -1552,22 +1742,31 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 }
 
 func apiStats(w http.ResponseWriter, r *http.Request) {
+	group := r.URL.Query().Get("group")
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	stat := map[string]int{
-		"sources_total": len(store.Sources), "sources_active": 0,
-		"articles_total": len(store.Articles),
+		"sources_total": 0, "sources_active": 0,
+		"articles_total": 0,
 		"pending":        0, "approved": 0, "published": 0, "duplicate": 0,
 		"high_imp": 0,
-		"briefs":   len(store.Briefs),
-		"pushes":   len(store.Pushes),
+		"briefs":   0,
+		"pushes":   0,
 	}
 	for _, s := range store.Sources {
+		if group != "" && s.Group != group {
+			continue
+		}
+		stat["sources_total"]++
 		if s.Active {
 			stat["sources_active"]++
 		}
 	}
 	for _, a := range store.Articles {
+		if group != "" && a.Group != group {
+			continue
+		}
+		stat["articles_total"]++
 		switch a.Status {
 		case "pending_review":
 			stat["pending"]++
@@ -1583,10 +1782,53 @@ func apiStats(w http.ResponseWriter, r *http.Request) {
 			stat["high_imp"]++
 		}
 	}
+	// 简报 / 推送：通过关联文章的 Group 判断（简报关联 article_ids，推送关联 brief_id）
+	briefHits := map[int]bool{}
+	for _, b := range store.Briefs {
+		if group == "" {
+			briefHits[b.ID] = true
+			stat["briefs"]++
+			continue
+		}
+		// 简报里至少 1 篇文章属于该组
+		for _, aid := range b.ArticleIDs {
+			for _, a := range store.Articles {
+				if a.ID == aid && a.Group == group {
+					briefHits[b.ID] = true
+					break
+				}
+			}
+			if briefHits[b.ID] {
+				break
+			}
+		}
+		if briefHits[b.ID] {
+			stat["briefs"]++
+		}
+	}
+	for _, p := range store.Pushes {
+		if group != "" && !briefHits[p.BriefID] {
+			continue
+		}
+		stat["pushes"]++
+	}
 	var ok, total int
 	cutoff := time.Now().Add(-24 * time.Hour)
 	for _, t := range store.Tasks {
 		if t.StartedAt.After(cutoff) {
+			if group != "" {
+				// 找该 source 当时的 Group
+				srcGroup := ""
+				for _, s := range store.Sources {
+					if s.ID == t.SourceID {
+						srcGroup = s.Group
+						break
+					}
+				}
+				if srcGroup != group {
+					continue
+				}
+			}
 			total++
 			if t.Status == "success" {
 				ok++
@@ -1604,11 +1846,26 @@ func apiStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func apiSources(w http.ResponseWriter, r *http.Request) {
+// apiUsers 返回种子用户列表，前端用于身份切换下拉
+func apiUsers(w http.ResponseWriter, r *http.Request) {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	out := make([]Source, len(store.Sources))
-	copy(out, store.Sources)
+	out := make([]User, len(store.Users))
+	copy(out, store.Users)
+	writeJSON(w, out)
+}
+
+func apiSources(w http.ResponseWriter, r *http.Request) {
+	group := r.URL.Query().Get("group")
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	out := []Source{}
+	for _, s := range store.Sources {
+		if group != "" && s.Group != group {
+			continue
+		}
+		out = append(out, s)
+	}
 	writeJSON(w, out)
 }
 
@@ -1713,7 +1970,7 @@ func apiSourceTest(w http.ResponseWriter, r *http.Request) {
 		}
 		preview := []map[string]string{}
 		for i, it := range items {
-			if i >= 3 {
+			if i >= 15 {
 				break
 			}
 			preview = append(preview, map[string]string{
@@ -1749,7 +2006,7 @@ func apiSourceTest(w http.ResponseWriter, r *http.Request) {
 		preview := []map[string]string{}
 		var firstDetail *crawlerDetailResult
 		for i, it := range listRes.Items {
-			if i >= 3 {
+			if i >= 15 {
 				break
 			}
 			preview = append(preview, map[string]string{
@@ -1790,7 +2047,7 @@ func apiSourceTest(w http.ResponseWriter, r *http.Request) {
 	items := parseListPage(in.URL, listHTML)
 	preview := []map[string]string{}
 	for i, it := range items {
-		if i >= 3 {
+		if i >= 15 {
 			break
 		}
 		preview = append(preview, map[string]string{
@@ -2037,18 +2294,79 @@ func apiCollect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, results)
 }
 
-func apiRunAI(w http.ResponseWriter, r *http.Request) {
-	store.mu.Lock()
-	count := 0
+// runAIBatch 对所有 status 在 targetStatuses 中的文章并发跑 AI 整理。
+// 并发上限默认 4（保护 DeepSeek 限流，也保护本地 CPU）。
+// 返回处理总数和各引擎计数。
+func runAIBatch(targetStatuses []string) (int, map[string]int) {
+	// 取出符合条件的索引（持读锁短时间）
+	store.mu.RLock()
+	want := map[string]bool{}
+	for _, s := range targetStatuses {
+		want[s] = true
+	}
+	indices := []int{}
 	for i := range store.Articles {
-		if store.Articles[i].Status == "collected" {
-			runOneAI(&store.Articles[i])
-			count++
+		if want[store.Articles[i].Status] {
+			indices = append(indices, i)
 		}
 	}
-	store.mu.Unlock()
+	store.mu.RUnlock()
+	if len(indices) == 0 {
+		return 0, map[string]int{}
+	}
+
+	const maxConcurrent = 4
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	engineCounts := map[string]int{}
+	var mu sync.Mutex
+
+	for _, idx := range indices {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// 拷贝文章避免长时间持锁；处理完写回
+			store.mu.RLock()
+			if i >= len(store.Articles) {
+				store.mu.RUnlock()
+				return
+			}
+			a := store.Articles[i]
+			store.mu.RUnlock()
+
+			runOneAI(&a)
+
+			store.mu.Lock()
+			if i < len(store.Articles) && store.Articles[i].ID == a.ID {
+				store.Articles[i] = a
+			}
+			store.mu.Unlock()
+
+			mu.Lock()
+			engineCounts[a.AIEngine]++
+			mu.Unlock()
+		}(idx)
+	}
+	wg.Wait()
 	store.save()
-	writeJSON(w, map[string]int{"processed": count})
+	return len(indices), engineCounts
+}
+
+func apiRunAI(w http.ResponseWriter, r *http.Request) {
+	// 支持 ?all=1 重跑所有文章（不限状态），用于批量重跑演示数据
+	all := r.URL.Query().Get("all") == "1"
+	statuses := []string{"collected"}
+	if all {
+		statuses = []string{"collected", "pending_review", "ai_done"}
+	}
+	count, engines := runAIBatch(statuses)
+	writeJSON(w, map[string]interface{}{
+		"processed": count,
+		"engines":   engines,
+		"model":     deepseekModel,
+	})
 }
 
 func apiSearch(w http.ResponseWriter, r *http.Request) {
@@ -2120,6 +2438,7 @@ func apiSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiBriefs(w http.ResponseWriter, r *http.Request) {
+	group := r.URL.Query().Get("group")
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	type bri struct {
@@ -2134,6 +2453,19 @@ func apiBriefs(w http.ResponseWriter, r *http.Request) {
 				if a.ID == id {
 					bb.Items = append(bb.Items, a)
 				}
+			}
+		}
+		// 组过滤：简报必须含至少 1 篇该组的文章
+		if group != "" {
+			match := false
+			for _, it := range bb.Items {
+				if it.Group == group {
+					match = true
+					break
+				}
+			}
+			if !match {
+				continue
 			}
 		}
 		out = append(out, bb)
@@ -2241,19 +2573,53 @@ func apiBriefPublish(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiPushes(w http.ResponseWriter, r *http.Request) {
+	group := r.URL.Query().Get("group")
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	out := make([]PushLog, len(store.Pushes))
-	copy(out, store.Pushes)
+	// 算出"属于该组"的简报集合
+	briefGroupOK := map[int]bool{}
+	if group != "" {
+		for _, b := range store.Briefs {
+			for _, aid := range b.ArticleIDs {
+				for _, a := range store.Articles {
+					if a.ID == aid && a.Group == group {
+						briefGroupOK[b.ID] = true
+						break
+					}
+				}
+				if briefGroupOK[b.ID] {
+					break
+				}
+			}
+		}
+	}
+	out := []PushLog{}
+	for _, p := range store.Pushes {
+		if group != "" && !briefGroupOK[p.BriefID] {
+			continue
+		}
+		out = append(out, p)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OccurredAt.After(out[j].OccurredAt) })
 	writeJSON(w, out)
 }
 
 func apiTasks(w http.ResponseWriter, r *http.Request) {
+	group := r.URL.Query().Get("group")
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	out := make([]TaskRun, len(store.Tasks))
-	copy(out, store.Tasks)
+	// source_id -> group
+	srcGroup := map[int]string{}
+	for _, s := range store.Sources {
+		srcGroup[s.ID] = s.Group
+	}
+	out := []TaskRun{}
+	for _, t := range store.Tasks {
+		if group != "" && srcGroup[t.SourceID] != group {
+			continue
+		}
+		out = append(out, t)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
 	if len(out) > 100 {
 		out = out[:100]
@@ -2302,17 +2668,8 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 	}
 	add(1, "全量采集", true, fmt.Sprintf("%d 个信息源，%d 成功，新增 %d 篇", len(collectResults), okCount, newTotal))
 
-	// 2) AI 整理（对所有 collected 状态文章）
-	store.mu.Lock()
-	aiCount := 0
-	for i := range store.Articles {
-		if store.Articles[i].Status == "collected" {
-			runOneAI(&store.Articles[i])
-			aiCount++
-		}
-	}
-	store.mu.Unlock()
-	store.save()
+	// 2) AI 整理（对所有 collected 状态文章，并发批处理）
+	aiCount, _ := runAIBatch([]string{"collected"})
 	add(2, "AI 智能整理", true, fmt.Sprintf("摘要 / 关键词 / 主题 / 重要性识别，共处理 %d 篇", aiCount))
 
 	// 3) 自动审核通过：取近 7 天「高/中重要性」最多 8 条
@@ -2414,7 +2771,7 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 	}
 	store.mu.Unlock()
 	store.save()
-	add(5, "企微推送", true, "已通过「应用消息」推送给张主任，返回码 0")
+	add(5, "企微推送", true, "（模拟）已通过「应用消息」推送给张主任，返回码 0")
 
 	writeJSON(w, out)
 }
