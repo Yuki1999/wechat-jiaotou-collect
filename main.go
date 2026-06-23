@@ -299,7 +299,7 @@ func httpGet(ctx context.Context, target string) (string, error) {
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
 	if err != nil {
 		return "", err
 	}
@@ -535,7 +535,56 @@ type feedItem struct {
 	Published time.Time
 }
 
+// sanitizeCDATA 处理 CDATA 内部出现 ]]>] 导致 XML 解析失败的情况。
+// 把 CDATA 区段内多余的 ]]> 拆成 ]]]]><![CDATA[>，让标准 XML 解析器能继续解析。
+func sanitizeCDATA(body string) string {
+	const start = "<![CDATA["
+	const end = "]]>"
+	var out strings.Builder
+	i := 0
+	for {
+		si := strings.Index(body[i:], start)
+		if si < 0 {
+			out.WriteString(body[i:])
+			break
+		}
+		si += i
+		out.WriteString(body[i : si+len(start)])
+		i = si + len(start)
+
+		// 当前 CDATA 内容到下一个 CDATA 开始或字符串末尾为止
+		nextStart := strings.Index(body[i:], start)
+		segmentEnd := len(body)
+		if nextStart >= 0 {
+			segmentEnd = i + nextStart
+		}
+		segment := body[i:segmentEnd]
+
+		for {
+			idx := strings.Index(segment, end)
+			if idx < 0 {
+				out.WriteString(segment)
+				i = segmentEnd
+				break
+			}
+			lastIdx := strings.LastIndex(segment, end)
+			if idx == lastIdx {
+				// 只剩一个 ]]>，视为 CDATA 正常结束
+				out.WriteString(segment)
+				i = segmentEnd
+				break
+			}
+			// 内部多余的 ]]>：拆成 ]]]]><![CDATA[>
+			out.WriteString(segment[:idx+len(end)])
+			out.WriteString("<![CDATA[>")
+			segment = segment[idx+len(end):]
+		}
+	}
+	return out.String()
+}
+
 func parseFeed(body string) ([]feedItem, error) {
+	body = sanitizeCDATA(body)
 	bs := []byte(body)
 	if strings.Contains(body, "<rss") || strings.Contains(body, "<channel") {
 		var d rssDoc
