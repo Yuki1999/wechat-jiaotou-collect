@@ -9,7 +9,14 @@
 <script src="https://unpkg.com/vue-router@4.3.0/dist/vue-router.global.prod.js"></script>
 </head>
 <body>
-<div id="app">
+<div id="app" :class="{ 'app-anon': isAnon }">
+  <!-- 登录页：独立全屏布局 -->
+  <template v-if="isAnon">
+    <router-view></router-view>
+  </template>
+
+  <!-- 业务页：侧边栏 + 顶栏 + 内容区 -->
+  <template v-else>
   <aside class="sidebar">
     <div class="brand">
       <div class="logo">党</div>
@@ -21,7 +28,7 @@
     <nav>
       <router-link to="/" exact-active-class="active"><span>📊</span>工作台</router-link>
       <router-link to="/sources" active-class="active"><span>🗂️</span>信息源管理</router-link>
-      <router-link to="/wechat2rss" active-class="active"><span>📡</span>公众号订阅</router-link>
+      <router-link to="/wechat2rss" v-if="canManageW2R()" active-class="active"><span>📡</span>公众号订阅</router-link>
       <router-link to="/tasks" active-class="active"><span>⏱️</span>采集任务</router-link>
       <router-link to="/review" active-class="active"><span>📝</span>审核工作台</router-link>
       <router-link to="/briefs" active-class="active"><span>📰</span>简报管理</router-link>
@@ -30,10 +37,10 @@
     </nav>
     <div class="sidebar-footer">
       <div class="user">
-        <div class="avatar">李</div>
+        <div class="avatar">{{ (currentUser.name || '?').slice(0,1) }}</div>
         <div>
-          <div class="user-name">王审核</div>
-          <div class="user-role">综合组 · 审核人员</div>
+          <div class="user-name">{{ currentUser.name || '未登录' }}</div>
+          <div class="user-role">{{ currentUser.group || '—' }} · {{ roleLabel(currentUser.role) }}</div>
         </div>
       </div>
     </div>
@@ -51,7 +58,26 @@
               :class="{ urgent: (globalStats.pending||0) > 20 }">📝 待审 <b>{{ globalStats.pending || 0 }}</b></span>
         <span class="topbar-stat" title="简报总数">📰 简报 <b>{{ globalStats.briefs || 0 }}</b></span>
         <span class="topbar-clock">{{ clock }}</span>
-        <span class="badge">Demo · v2.1</span>
+
+        <!-- 用户菜单 -->
+        <div class="user-menu-wrap" v-if="currentUser.id">
+          <button class="user-menu-btn" @click="toggleUserMenu">
+            <span class="user-menu-avatar">{{ (currentUser.name || '?').slice(0,1) }}</span>
+            <span class="user-menu-text">
+              <b>{{ currentUser.name }}</b>
+              <small>{{ roleLabel(currentUser.role) }} · {{ currentUser.group || '—' }}</small>
+            </span>
+            <span class="user-menu-caret">▾</span>
+          </button>
+          <div v-if="showUserMenu" class="user-menu">
+            <div class="user-menu-head">
+              <div><b>{{ currentUser.name }}</b></div>
+              <div class="hint">@{{ currentUser.username }} · {{ roleLabel(currentUser.role) }} · {{ currentUser.group || '—' }}</div>
+            </div>
+            <button class="user-menu-item" @click="openChangePassword">🔑 修改密码</button>
+            <button class="user-menu-item danger" @click="logout">🚪 退出登录</button>
+          </div>
+        </div>
       </div>
     </header>
     <section class="content">
@@ -62,6 +88,7 @@
       </router-view>
     </section>
   </main>
+  </template>
 
   <!-- 全局组件容器 -->
   <div class="global-progress" :class="{ active: ui.progress.active, done: ui.progress.done }"></div>
@@ -90,7 +117,7 @@
               <option v-for="o in it.options" :key="o.value" :value="o.value">{{ o.label }}</option>
             </select>
             <textarea v-else-if="it.type==='textarea'" v-model="it.value" :placeholder="it.placeholder"></textarea>
-            <input v-else v-model="it.value" :placeholder="it.placeholder">
+            <input v-else :type="it.type==='password' ? 'password' : 'text'" v-model="it.value" :placeholder="it.placeholder">
           </div>
         </div>
       </div>

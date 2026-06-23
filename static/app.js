@@ -18,69 +18,48 @@ const ui = reactive({
 });
 
 // ========== 当前身份（用于按组过滤）==========
-// 从 localStorage 读 + 默认综合组王审核。
-// viewAll=true 时显示全部，否则按用户的 group 过滤。
+// 登录后 token 和用户信息存 localStorage
+function loadAuthToken() { return localStorage.getItem('dzb_token') || ''; }
 function loadCurrentUser() {
   try {
     const raw = localStorage.getItem('dzb_user');
     if (raw) return JSON.parse(raw);
   } catch (e) {}
-  return { id: 0, name: '王审核', group: '综合组', role: 'reviewer' };
+  return null;
 }
-const currentUser = reactive(loadCurrentUser());
-const viewAll = ref(localStorage.getItem('dzb_view_all') === '1');
-function saveCurrentUser() {
-  localStorage.setItem('dzb_user', JSON.stringify({
-    id: currentUser.id, name: currentUser.name, group: currentUser.group, role: currentUser.role,
-  }));
-  localStorage.setItem('dzb_view_all', viewAll.value ? '1' : '0');
+function saveAuth(token, user) {
+  if (token) localStorage.setItem('dzb_token', token);
+  if (user) localStorage.setItem('dzb_user', JSON.stringify(user));
 }
-function setUser(u) {
-  Object.assign(currentUser, u);
-  saveCurrentUser();
-  showToast(`已切换身份：${u.name} · ${u.group}`, 'info');
-}
-function toggleViewAll() {
-  viewAll.value = !viewAll.value;
-  saveCurrentUser();
-}
-// 把 currentUser.group 作为 ?group= 拼到 URL（除非选了"全部"或用户没 group）
-function withGroup(url) {
-  if (viewAll.value || !currentUser.group) return url;
-  const sep = url.includes('?') ? '&' : '?';
-  // 接口 URL 本身已经带 group 参数则不重复添加
-  if (url.includes('group=')) return url;
-  return url + sep + 'group=' + encodeURIComponent(currentUser.group);
+function clearAuth() {
+  localStorage.removeItem('dzb_token');
+  localStorage.removeItem('dzb_user');
+  authToken.value = '';
+  Object.keys(currentUser).forEach(k => delete currentUser[k]);
 }
 
-// 不需要按组过滤的接口（详情/外部代理/系统状态）
-const NO_GROUP_PATTERNS = [
-  '/api/article?',           // 单条文章详情
-  '/api/users',              // 用户列表
-  '/api/w2r/',               // wechat2rss 代理（与组无关）
-  '/api/sources/test',       // 测试采集
-  '/api/article/update',     // 更新单条
-  '/api/article/approve',    // 审核动作
-  '/api/article/reject',
-  '/api/sources/create',
-  '/api/sources/delete',
-  '/api/sources/toggle',
-  '/api/sources/bulk_import',
-  '/api/briefs/publish',
-  '/api/briefs/export',
-  '/api/collect',            // 触发采集
-  '/api/ai',                 // 触发 AI
-  '/api/demo/full',          // 一键演示
-];
-function shouldAddGroup(url) {
-  for (const p of NO_GROUP_PATTERNS) {
-    if (url.startsWith(p) || url.indexOf(p) >= 0) return false;
-  }
-  return true;
+const authToken = ref(loadAuthToken());
+const currentUser = reactive(loadCurrentUser() || {});
+
+// 角色 → 中文 + 颜色
+const ROLE_LABEL = {
+  admin: '管理员', leader: '主任', editor: '干事', reviewer: '审核员',
+};
+function roleLabel(r) { return ROLE_LABEL[r] || r || '用户'; }
+function hasRole(roles) {
+  if (!currentUser.role) return false;
+  return roles.includes(currentUser.role);
 }
-function maybeWithGroup(url) {
-  return shouldAddGroup(url) ? withGroup(url) : url;
+function canWrite() {
+  return hasRole(['admin', 'leader', 'editor', 'reviewer']);
 }
+function canManageSources() { return hasRole(['admin', 'editor']); }
+function canPublishBrief() { return hasRole(['admin', 'leader']); }
+function canGenerateBrief() { return hasRole(['admin', 'leader', 'editor']); }
+function canRunAI() { return hasRole(['admin', 'editor']); }
+function canDemoFull() { return hasRole(['admin', 'leader']); }
+function canManageW2R() { return hasRole(['admin', 'editor']); }
+function canManageAccounts() { return hasRole(['admin']); }
 let _toastId = 0;
 let _loadingStack = 0;
 
@@ -103,29 +82,44 @@ function stopLoading() {
 }
 
 const api = {
-  async get(url) {
+  async _fetch(url, opts) {
     startLoading();
     try {
-      const r = await fetch(url);
+      // 自动带 Bearer token
+      opts = opts || {};
+      opts.headers = Object.assign({}, opts.headers || {});
+      if (authToken.value) {
+        opts.headers['Authorization'] = 'Bearer ' + authToken.value;
+      }
+      const r = await fetch(url, opts);
+      // 401 自动跳登录
+      if (r.status === 401) {
+        clearAuth();
+        if (window.location.hash !== '#/login') {
+          showToast('会话已过期，请重新登录', 'warning');
+          window.location.hash = '#/login';
+        }
+        return null;
+      }
+      if (r.status === 403) {
+        let msg = '当前角色无权执行此操作';
+        try { const j = await r.clone().json(); if (j.err) msg = j.err; } catch (e) {}
+        showToast(msg, 'error');
+        return null;
+      }
       return await r.json();
     } catch (e) {
       showToast('请求失败：' + e.message, 'error');
       return null;
     } finally { stopLoading(); }
   },
-  async post(url, body) {
-    startLoading();
-    try {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body || {}),
-      });
-      return await r.json();
-    } catch (e) {
-      showToast('请求失败：' + e.message, 'error');
-      return null;
-    } finally { stopLoading(); }
+  get(url) { return this._fetch(url); },
+  post(url, body) {
+    return this._fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
   },
 };
 
@@ -246,6 +240,92 @@ function onGlobalKeydown(e) {
     window.location.hash = '#/knowledge';
   }
 }
+
+// ============================================================
+// 0. 登录页 Login
+// ============================================================
+const Login = defineComponent({
+  setup() {
+    const username = ref('');
+    const password = ref('');
+    const busy = ref(false);
+    const errMsg = ref('');
+    const showHelp = ref(false);
+
+    async function doLogin() {
+      errMsg.value = '';
+      if (!username.value || !password.value) {
+        errMsg.value = '请输入用户名和密码';
+        return;
+      }
+      busy.value = true;
+      try {
+        const r = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username.value, password: password.value }),
+        });
+        const data = await r.json();
+        if (!r.ok || !data.token) {
+          errMsg.value = data.err || '登录失败';
+          return;
+        }
+        saveAuth(data.token, data.user);
+        authToken.value = data.token;
+        Object.assign(currentUser, data.user);
+        showToast(`欢迎，${data.user.name}`, 'success');
+        // 登录成功跳工作台
+        window.location.hash = '#/';
+      } finally { busy.value = false; }
+    }
+
+    function pickQuick(u, p) {
+      username.value = u; password.value = p; doLogin();
+    }
+
+    return { username, password, busy, errMsg, showHelp, doLogin, pickQuick };
+  },
+  template: `
+  <div class="login-page">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-logo">党</div>
+        <h1>党政办信息跟踪与智能整理系统</h1>
+        <div class="login-sub">跟踪 · 整理 · 协同</div>
+      </div>
+      <div class="login-body">
+        <div class="field">
+          <label>用户名</label>
+          <input v-model="username" placeholder="如 li / wang / admin" @keyup.enter="doLogin" autofocus>
+        </div>
+        <div class="field">
+          <label>密码</label>
+          <input v-model="password" type="password" placeholder="默认 dzb2025" @keyup.enter="doLogin">
+        </div>
+        <div v-if="errMsg" class="login-err">⚠️ {{ errMsg }}</div>
+        <button class="btn primary lg" style="width:100%;margin-top:10px;" @click="doLogin" :disabled="busy">
+          {{ busy ? '⏳ 登录中…' : '🔑 登录' }}
+        </button>
+        <div class="login-quick">
+          <div class="login-quick-label">快速登录（演示用）：</div>
+          <div class="login-quick-grid">
+            <button class="btn ghost sm" @click="pickQuick('admin','dzb2025')">管理员</button>
+            <button class="btn ghost sm" @click="pickQuick('zhang','dzb2025')">张主任</button>
+            <button class="btn ghost sm" @click="pickQuick('li','dzb2025')">李审核·综合组</button>
+            <button class="btn ghost sm" @click="pickQuick('wang','dzb2025')">王干事·招商组</button>
+            <button class="btn ghost sm" @click="pickQuick('zhao','dzb2025')">赵干事·综合组</button>
+            <button class="btn ghost sm" @click="pickQuick('chen','dzb2025')">陈干事·专题组</button>
+          </div>
+        </div>
+      </div>
+      <div class="login-foot">
+        <span>© 党政办信息系统</span>
+        <span class="hint">演示密码：<code>dzb2025</code></span>
+      </div>
+    </div>
+  </div>`
+});
+
 
 // ============================================================
 // 1. 工作台 Dashboard
@@ -2029,6 +2109,7 @@ const Wechat2RSS = defineComponent({
 
 
 const routes = [
+  { path: '/login', component: Login, meta: { title: '登录', anonymous: true } },
   { path: '/', component: Dashboard, meta: { title: '工作台' } },
   { path: '/sources', component: Sources, meta: { title: '信息源管理' } },
   { path: '/wechat2rss', component: Wechat2RSS, meta: { title: '公众号订阅' } },
@@ -2040,10 +2121,23 @@ const routes = [
 ];
 const router = createRouter({ history: createWebHashHistory(), routes });
 
+// 路由守卫：未登录 → /login；已登录访问 /login → /
+router.beforeEach((to, from, next) => {
+  const anon = !!to.meta?.anonymous;
+  if (!authToken.value && !anon) {
+    next('/login');
+  } else if (authToken.value && to.path === '/login') {
+    next('/');
+  } else {
+    next();
+  }
+});
+
 const App = {
   setup() {
     const route = useRoute();
     const pageTitle = computed(() => route.meta?.title || '工作台');
+    const isAnon = computed(() => !!route.meta?.anonymous);
     const clock = ref('');
     const globalStats = reactive({ sources_active: 0, pending: 0, briefs: 0 });
 
@@ -2055,10 +2149,10 @@ const App = {
       clock.value = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
     }
     async function refreshStats() {
+      if (isAnon.value || !authToken.value) return;
       const s = await api.get('/api/stats');
       if (s && s.stat) Object.assign(globalStats, s.stat);
     }
-    // 任意页面变化也立即刷新一次徽章
     watch(() => route.path, refreshStats);
     onMounted(() => {
       updateClock();
@@ -2073,7 +2167,48 @@ const App = {
       document.removeEventListener('keydown', onGlobalKeydown);
     });
 
-    return { pageTitle, clock, globalStats, ui, closeToast, resolveModal };
+    // ---- 用户菜单交互 ----
+    const showUserMenu = ref(false);
+    function toggleUserMenu() { showUserMenu.value = !showUserMenu.value; }
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.user-menu-wrap')) showUserMenu.value = false;
+    });
+
+    async function logout() {
+      try { await api.post('/api/auth/logout'); } catch (e) {}
+      clearAuth();
+      showToast('已退出登录', 'info');
+      window.location.hash = '#/login';
+    }
+
+    async function openChangePassword() {
+      showUserMenu.value = false;
+      const res = await showPrompt('修改密码', [
+        { label: '原密码', type: 'password', placeholder: '请输入当前密码', value: '' },
+        { label: '新密码（至少 6 位）', type: 'password', placeholder: '6 位以上', value: '' },
+        { label: '确认新密码', type: 'password', placeholder: '再次输入', value: '' },
+      ]);
+      if (!res) return;
+      const [oldPw, newPw, confirm] = res;
+      if (!oldPw || !newPw) { showToast('密码不能为空', 'warning'); return; }
+      if (newPw !== confirm) { showToast('两次新密码输入不一致', 'error'); return; }
+      if (newPw.length < 6) { showToast('新密码至少 6 位', 'warning'); return; }
+      const r = await api.post('/api/auth/change_password', { old_password: oldPw, new_password: newPw });
+      if (r && r.ok === '1') {
+        showToast('密码已修改，请重新登录', 'success');
+        setTimeout(logout, 800);
+      }
+    }
+
+    // 暴露给模板（包括侧边栏角色屏蔽用的 has* 方法）
+    return {
+      pageTitle, isAnon, clock, globalStats, ui,
+      currentUser, authToken, roleLabel,
+      hasRole, canManageSources, canPublishBrief, canGenerateBrief,
+      canRunAI, canDemoFull, canManageW2R, canManageAccounts,
+      showUserMenu, toggleUserMenu, logout, openChangePassword,
+      closeToast, resolveModal,
+    };
   },
 };
 

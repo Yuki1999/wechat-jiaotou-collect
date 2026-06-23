@@ -31,10 +31,15 @@ var assets embed.FS
 // ===================== 数据模型 =====================
 
 type User struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	Group string `json:"group"`
-	Role  string `json:"role"`
+	ID           int       `json:"id"`
+	Name         string    `json:"name"`
+	Username     string    `json:"username"`      // 登录名
+	PasswordHash string    `json:"password_hash"` // sha256(plain) hex
+	Group        string    `json:"group"`
+	Role         string    `json:"role"` // admin / leader / editor / reviewer
+	Active       bool      `json:"active"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastLoginAt  time.Time `json:"last_login_at"`
 }
 
 type Source struct {
@@ -75,7 +80,8 @@ type Article struct {
 	Keywords      []string  `json:"keywords"`
 	Topics        []string  `json:"topics"`
 	Confidence    float64   `json:"confidence"`
-	AIEngine      string    `json:"ai_engine"` // deepseek-v4-pro / rule / ""
+	AIEngine      string    `json:"ai_engine"` // deepseek-v4-pro / ""
+	AIError       string    `json:"ai_error,omitempty"`
 	Evidence      string    `json:"evidence"`
 	DuplicateOf   int       `json:"duplicate_of,omitempty"`
 	OwnerID       int       `json:"owner_id"`
@@ -181,16 +187,21 @@ func loadStore() *Store {
 // 同时预留两条 RSS / wechat2rss 占位条目（默认停用，部署 wechat2rss 后填入 URL 即可启用）。
 
 func seed(s *Store) {
+	// 演示默认密码（生产环境务必修改）
+	defPwHash := sha256hex("dzb2025")
 	users := []User{
-		{Name: `张主任`, Group: `综合组`, Role: "leader"},
-		{Name: `王审核`, Group: `综合组`, Role: "reviewer"},
-		{Name: `王干事`, Group: `招商组`, Role: "staff"},
-		{Name: `赵干事`, Group: `综合组`, Role: "staff"},
-		{Name: `陈干事`, Group: `专题组`, Role: "staff"},
-		{Name: `管理员`, Group: `运维组`, Role: "admin"},
+		{Name: `张主任`, Username: "zhang", Group: `综合组`, Role: "leader"},
+		{Name: `李审核`, Username: "li", Group: `综合组`, Role: "reviewer"},
+		{Name: `王干事`, Username: "wang", Group: `招商组`, Role: "editor"},
+		{Name: `赵干事`, Username: "zhao", Group: `综合组`, Role: "editor"},
+		{Name: `陈干事`, Username: "chen", Group: `专题组`, Role: "editor"},
+		{Name: `管理员`, Username: "admin", Group: `运维组`, Role: "admin"},
 	}
 	for i := range users {
 		users[i].ID = s.nextID("user")
+		users[i].PasswordHash = defPwHash
+		users[i].Active = true
+		users[i].CreatedAt = time.Now()
 	}
 	s.Users = users
 
@@ -865,19 +876,15 @@ func runOneCollect(s *Store, src *Source) TaskRun {
 }
 
 func collectHTML(ctx context.Context, s *Store, src *Source, tr TaskRun) TaskRun {
-	// 优先走 crawl4ai 通用采集微服务
-	if crawlerHealth() {
-		tr2 := collectHTMLViaCrawler(ctx, s, src, tr)
-		if tr2.Status == "success" {
-			return tr2
-		}
-		// 微服务跑失败 → 降级到原正则，并把微服务错误记到日志
-		log.Printf("[collect] crawler service failed for %s: %s, falling back to regex", src.Unit, tr2.Error)
-		if tr2.Error != "" {
-			// 不直接返回，继续走下面原逻辑
-		}
+	// 只走 crawl4ai 通用采集微服务，失败不再降级到正则兜底
+	if !crawlerHealth() {
+		return failTask(s, src, tr, "crawler 微服务未就绪")
 	}
-	return collectHTMLRegex(ctx, s, src, tr)
+	tr2 := collectHTMLViaCrawler(ctx, s, src, tr)
+	if tr2.Status != "success" {
+		log.Printf("[collect] crawler service failed for %s: %s", src.Unit, tr2.Error)
+	}
+	return tr2
 }
 
 // collectHTMLViaCrawler 走 Python crawl4ai 微服务的实现
@@ -1053,7 +1060,7 @@ func failTask(s *Store, src *Source, tr TaskRun, msg string) TaskRun {
 //   DEEPSEEK_API_KEY  必填，签发于 platform.deepseek.com
 //   DEEPSEEK_MODEL    可选，默认 deepseek-v4-pro
 //   DEEPSEEK_BASE     可选，默认 https://api.deepseek.com
-// 未配置 key 时所有调用自动降级到本地规则引擎。
+// 未配置 key 或 DeepSeek 调用失败时，文章状态标记为 failed，不再使用本地规则引擎兜底。
 var (
 	deepseekKey   = ""
 	deepseekModel = "deepseek-v4-pro"
@@ -1085,33 +1092,36 @@ type deepseekAIResult struct {
 	Keywords      []string `json:"keywords"`
 }
 
-// runOneAI 主入口：优先调 DeepSeek（含 1 次重试），失败降级到本地规则。
+// runOneAI 主入口：只调 DeepSeek（含 1 次重试），不再降级到本地规则引擎。
 // 单文章处理，调用方负责并发控制。
 func runOneAI(a *Article) {
 	if len([]rune(a.Content)) < 30 {
 		a.Status = "failed"
+		a.AIError = "正文过短，无法调用 DeepSeek 整理"
 		return
 	}
-	if deepseekKey != "" {
-		var lastErr error
-		for attempt := 0; attempt < 2; attempt++ {
-			if err := runOneAIDeepSeek(a); err == nil {
-				a.AIEngine = deepseekModel
-				a.Status = "pending_review"
-				return
-			} else {
-				lastErr = err
-				// 第 1 次失败时短暂等待再重试（DeepSeek 偶发 empty content）
-				if attempt == 0 {
-					time.Sleep(1500 * time.Millisecond)
-				}
-			}
-		}
-		log.Printf("[ai] DeepSeek failed (after retry) for article id=%d: %v, falling back to rule", a.ID, lastErr)
+	if deepseekKey == "" {
+		a.Status = "failed"
+		a.AIError = "DEEPSEEK_API_KEY 未配置"
+		return
 	}
-	runOneAIRule(a)
-	a.AIEngine = "rule"
-	a.Status = "pending_review"
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := runOneAIDeepSeek(a); err == nil {
+			a.AIEngine = deepseekModel
+			a.Status = "pending_review"
+			return
+		} else {
+			lastErr = err
+		}
+		// 第 1 次失败时短暂等待再重试（DeepSeek 偶发 empty content）
+		if attempt == 0 {
+			time.Sleep(1500 * time.Millisecond)
+		}
+	}
+	log.Printf("[ai] DeepSeek failed (after retry) for article id=%d: %v", a.ID, lastErr)
+	a.Status = "failed"
+	a.AIError = "DeepSeek 调用失败: " + lastErr.Error()
 }
 
 // runOneAIDeepSeek 调 DeepSeek 一次拿全 6 个字段
@@ -1336,6 +1346,348 @@ func trunc(s string, n int) string {
 // ===================== HTTP =====================
 
 var store *Store
+
+// ===================== 鉴权 / Session 管理 =====================
+//
+// 设计：
+//   - Bearer token，登录时签发，前端存 localStorage，每请求带 Authorization 头
+//   - session 存内存 map，token → User 副本 + 过期时间
+//   - 默认会话有效期 12 小时；每次访问自动 sliding renewal
+//   - 单用户多 token（不限制并发登录）
+//   - rate limit：同 username 每分钟最多 10 次登录尝试，避免暴破
+//
+// 角色权限：
+//   - admin   : 全部
+//   - leader  : 看全部，可审核 / 发简报，但不能删用户
+//   - editor  : 仅本组数据；可增删改本组信息源；可审核本组
+//   - reviewer: 仅本组数据；只能审核本组内容（不能改信息源）
+
+type Session struct {
+	Token     string
+	UserID    int
+	Username  string
+	Name      string
+	Group     string
+	Role      string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+type sessionMgr struct {
+	mu       sync.Mutex
+	sessions map[string]*Session
+	// 登录失败计数：username → []time.Time
+	failures map[string][]time.Time
+}
+
+var sessions = &sessionMgr{
+	sessions: make(map[string]*Session),
+	failures: make(map[string][]time.Time),
+}
+
+const (
+	sessionTTL       = 12 * time.Hour
+	loginRateLimit   = 10
+	loginRateWindow  = 1 * time.Minute
+	tokenHeader      = "Authorization"
+	tokenHeaderPfx   = "Bearer "
+)
+
+func (m *sessionMgr) issue(u User) *Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tok := genToken()
+	now := time.Now()
+	s := &Session{
+		Token: tok, UserID: u.ID, Username: u.Username, Name: u.Name,
+		Group: u.Group, Role: u.Role,
+		CreatedAt: now, ExpiresAt: now.Add(sessionTTL),
+	}
+	m.sessions[tok] = s
+	return s
+}
+
+func (m *sessionMgr) get(tok string) *Session {
+	if tok == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[tok]
+	if !ok {
+		return nil
+	}
+	if time.Now().After(s.ExpiresAt) {
+		delete(m.sessions, tok)
+		return nil
+	}
+	// sliding renewal
+	s.ExpiresAt = time.Now().Add(sessionTTL)
+	return s
+}
+
+func (m *sessionMgr) revoke(tok string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, tok)
+}
+
+// failureCount 返回该 username 在 window 内的失败次数
+func (m *sessionMgr) failureCount(username string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cutoff := time.Now().Add(-loginRateWindow)
+	arr := m.failures[username]
+	out := arr[:0]
+	for _, t := range arr {
+		if t.After(cutoff) {
+			out = append(out, t)
+		}
+	}
+	m.failures[username] = out
+	return len(out)
+}
+
+func (m *sessionMgr) recordFailure(username string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failures[username] = append(m.failures[username], time.Now())
+}
+
+func (m *sessionMgr) clearFailures(username string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.failures, username)
+}
+
+// genToken 32 字节随机 hex
+func genToken() string {
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = byte(rand.Intn(256))
+	}
+	return hex.EncodeToString(b)
+}
+
+// extractToken 从 Authorization 头里抠出 token
+func extractToken(r *http.Request) string {
+	v := r.Header.Get(tokenHeader)
+	if strings.HasPrefix(v, tokenHeaderPfx) {
+		return strings.TrimSpace(v[len(tokenHeaderPfx):])
+	}
+	// 兼容 query 参数（少用，用于测试）
+	if t := r.URL.Query().Get("_token"); t != "" {
+		return t
+	}
+	return ""
+}
+
+// currentSession 从请求里取当前会话；无 → 返 nil
+func currentSession(r *http.Request) *Session {
+	return sessions.get(extractToken(r))
+}
+
+// requireAuth 包装一个 handler，要求登录
+func requireAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s := currentSession(r)
+		if s == nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"err":"未登录或会话已过期，请重新登录","code":"unauthorized"}`))
+			return
+		}
+		// 把 session 注入到 request context
+		ctx := context.WithValue(r.Context(), ctxSessionKey, s)
+		h(w, r.WithContext(ctx))
+	}
+}
+
+// requireRole 包装：要求当前用户角色在允许集合里
+func requireRole(allowedRoles []string, h http.HandlerFunc) http.HandlerFunc {
+	allowed := map[string]bool{}
+	for _, r := range allowedRoles {
+		allowed[r] = true
+	}
+	return requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		s, _ := r.Context().Value(ctxSessionKey).(*Session)
+		if s == nil || !allowed[s.Role] {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"err":"当前角色无权执行此操作","code":"forbidden"}`))
+			return
+		}
+		h(w, r)
+	})
+}
+
+// effectiveGroup 根据当前角色决定数据过滤的 group：
+//   - admin/leader → 空字符串（不过滤，看全部）
+//   - editor/reviewer → 该用户的 group（只看本组）
+// 若 query 显式带 group=，仅 admin/leader 可生效；editor/reviewer 强制覆盖为自己的组（防越权）。
+func effectiveGroup(r *http.Request) string {
+	s := currentSession(r)
+	if s == nil {
+		return ""
+	}
+	if s.Role == "admin" || s.Role == "leader" {
+		// 高权限：尊重 query 参数（可主动过滤某组）
+		return r.URL.Query().Get("group")
+	}
+	// 普通：强制按自己组过滤（忽略客户端传值）
+	return s.Group
+}
+
+type ctxKey string
+
+const ctxSessionKey ctxKey = "session"
+
+// ---- /api/auth/* 接口 ----
+
+func apiAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, map[string]string{"err": "请求格式错误", "code": "bad_request"})
+		return
+	}
+	in.Username = strings.TrimSpace(in.Username)
+	if in.Username == "" || in.Password == "" {
+		w.WriteHeader(400)
+		writeJSON(w, map[string]string{"err": "用户名和密码不能为空", "code": "missing_field"})
+		return
+	}
+	// rate limit
+	if sessions.failureCount(in.Username) >= loginRateLimit {
+		w.WriteHeader(429)
+		writeJSON(w, map[string]string{
+			"err":  fmt.Sprintf("登录失败次数过多，请 %d 秒后再试", int(loginRateWindow.Seconds())),
+			"code": "rate_limited",
+		})
+		return
+	}
+
+	store.mu.RLock()
+	var found *User
+	for i := range store.Users {
+		if store.Users[i].Username == in.Username {
+			u := store.Users[i]
+			found = &u
+			break
+		}
+	}
+	store.mu.RUnlock()
+
+	if found == nil {
+		sessions.recordFailure(in.Username)
+		w.WriteHeader(401)
+		writeJSON(w, map[string]string{"err": "用户名不存在", "code": "user_not_found"})
+		return
+	}
+	if !found.Active {
+		w.WriteHeader(403)
+		writeJSON(w, map[string]string{"err": "该账号已被禁用，请联系管理员", "code": "user_disabled"})
+		return
+	}
+	if found.PasswordHash != sha256hex(in.Password) {
+		sessions.recordFailure(in.Username)
+		w.WriteHeader(401)
+		writeJSON(w, map[string]string{"err": "密码错误", "code": "wrong_password"})
+		return
+	}
+
+	sessions.clearFailures(in.Username)
+	// 更新 last_login
+	store.mu.Lock()
+	for i := range store.Users {
+		if store.Users[i].ID == found.ID {
+			store.Users[i].LastLoginAt = time.Now()
+		}
+	}
+	store.mu.Unlock()
+	store.save()
+
+	sess := sessions.issue(*found)
+	writeJSON(w, map[string]interface{}{
+		"token": sess.Token,
+		"user": map[string]interface{}{
+			"id": found.ID, "username": found.Username, "name": found.Name,
+			"group": found.Group, "role": found.Role,
+		},
+		"expires_at": sess.ExpiresAt,
+	})
+}
+
+func apiAuthLogout(w http.ResponseWriter, r *http.Request) {
+	tok := extractToken(r)
+	if tok != "" {
+		sessions.revoke(tok)
+	}
+	writeJSON(w, map[string]string{"ok": "1"})
+}
+
+func apiAuthMe(w http.ResponseWriter, r *http.Request) {
+	s := currentSession(r)
+	if s == nil {
+		w.WriteHeader(401)
+		writeJSON(w, map[string]string{"err": "未登录", "code": "unauthorized"})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"id": s.UserID, "username": s.Username, "name": s.Name,
+		"group": s.Group, "role": s.Role,
+		"expires_at": s.ExpiresAt,
+	})
+}
+
+func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	s := currentSession(r)
+	if s == nil {
+		w.WriteHeader(401)
+		writeJSON(w, map[string]string{"err": "未登录", "code": "unauthorized"})
+		return
+	}
+	var in struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		w.WriteHeader(400)
+		writeJSON(w, map[string]string{"err": "请求格式错误"})
+		return
+	}
+	if len(in.NewPassword) < 6 {
+		w.WriteHeader(400)
+		writeJSON(w, map[string]string{"err": "新密码长度至少 6 位"})
+		return
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for i := range store.Users {
+		if store.Users[i].ID == s.UserID {
+			if store.Users[i].PasswordHash != sha256hex(in.OldPassword) {
+				w.WriteHeader(400)
+				writeJSON(w, map[string]string{"err": "原密码错误"})
+				return
+			}
+			store.Users[i].PasswordHash = sha256hex(in.NewPassword)
+			break
+		}
+	}
+	store.save()
+	writeJSON(w, map[string]string{"ok": "1"})
+}
+
 
 // ===================== wechat2rss 集成 =====================
 
@@ -1730,43 +2082,58 @@ func main() {
 	sub, _ := fs.Sub(assets, "static")
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
 
-	http.HandleFunc("/api/stats", apiStats)
-	http.HandleFunc("/api/users", apiUsers)
-	http.HandleFunc("/api/sources", apiSources)
-	http.HandleFunc("/api/sources/create", apiSourceCreate)
-	http.HandleFunc("/api/sources/bulk_import", apiSourceBulkImport)
-	http.HandleFunc("/api/sources/toggle", apiSourceToggle)
-	http.HandleFunc("/api/sources/delete", apiSourceDelete)
-	http.HandleFunc("/api/sources/test", apiSourceTest)
-	http.HandleFunc("/api/articles", apiArticles)
-	http.HandleFunc("/api/article", apiArticleDetail)
-	http.HandleFunc("/api/article/update", apiArticleUpdate)
-	http.HandleFunc("/api/article/approve", apiArticleApprove)
-	http.HandleFunc("/api/article/reject", apiArticleReject)
-	http.HandleFunc("/api/collect", apiCollect)
-	http.HandleFunc("/api/ai", apiRunAI)
-	http.HandleFunc("/api/search", apiSearch)
-	http.HandleFunc("/api/briefs", apiBriefs)
-	http.HandleFunc("/api/briefs/generate", apiBriefGenerate)
-	http.HandleFunc("/api/briefs/publish", apiBriefPublish)
-	http.HandleFunc("/api/briefs/export", apiBriefExport)
-	http.HandleFunc("/api/pushes", apiPushes)
-	http.HandleFunc("/api/tasks", apiTasks)
-	http.HandleFunc("/api/demo/full", apiDemoFull)
+	// ---- /api/auth/* （登录 / 注销 / 当前用户） ----
+	http.HandleFunc("/api/auth/login", apiAuthLogin)
+	http.HandleFunc("/api/auth/logout", apiAuthLogout)
+	http.HandleFunc("/api/auth/me", apiAuthMe)
+	http.HandleFunc("/api/auth/change_password", requireAuth(apiAuthChangePassword))
 
-	// ---- wechat2rss 集成 ----
-	http.HandleFunc("/api/w2r/health", apiW2RHealth)
-	http.HandleFunc("/api/w2r/accounts", apiW2RAccounts)
-	http.HandleFunc("/api/w2r/accounts/login", apiW2RAccountLogin)
-	http.HandleFunc("/api/w2r/accounts/code", apiW2RAccountCode)
-	http.HandleFunc("/api/w2r/accounts/refresh", apiW2RAccountRefresh)
-	http.HandleFunc("/api/w2r/accounts/del", apiW2RAccountDel)
-	http.HandleFunc("/api/w2r/feeds", apiW2RFeeds)
-	http.HandleFunc("/api/w2r/feeds/add_url", apiW2RFeedAddURL)
-	http.HandleFunc("/api/w2r/feeds/add_id", apiW2RFeedAddID)
-	http.HandleFunc("/api/w2r/feeds/del", apiW2RFeedDel)
-	http.HandleFunc("/api/w2r/feeds/pause", apiW2RFeedPause)
-	http.HandleFunc("/api/w2r/feeds/sync", apiW2RFeedsSync)
+	// ---- 业务读接口（所有登录用户，按 effectiveGroup 自动过滤） ----
+	http.HandleFunc("/api/stats", requireAuth(apiStats))
+	http.HandleFunc("/api/users", requireAuth(apiUsers))
+	http.HandleFunc("/api/sources", requireAuth(apiSources))
+	http.HandleFunc("/api/sources/test", requireAuth(apiSourceTest))
+	http.HandleFunc("/api/articles", requireAuth(apiArticles))
+	http.HandleFunc("/api/article", requireAuth(apiArticleDetail))
+	http.HandleFunc("/api/search", requireAuth(apiSearch))
+	http.HandleFunc("/api/briefs", requireAuth(apiBriefs))
+	http.HandleFunc("/api/briefs/export", requireAuth(apiBriefExport))
+	http.HandleFunc("/api/pushes", requireAuth(apiPushes))
+	http.HandleFunc("/api/tasks", requireAuth(apiTasks))
+
+	// ---- 信息源 写接口：admin / editor ----
+	http.HandleFunc("/api/sources/create", requireRole([]string{"admin", "editor"}, apiSourceCreate))
+	http.HandleFunc("/api/sources/bulk_import", requireRole([]string{"admin", "editor"}, apiSourceBulkImport))
+	http.HandleFunc("/api/sources/toggle", requireRole([]string{"admin", "editor"}, apiSourceToggle))
+	http.HandleFunc("/api/sources/delete", requireRole([]string{"admin", "editor"}, apiSourceDelete))
+
+	// ---- 审核：admin/leader/editor/reviewer 都能改 ----
+	http.HandleFunc("/api/article/update", requireAuth(apiArticleUpdate))
+	http.HandleFunc("/api/article/approve", requireAuth(apiArticleApprove))
+	http.HandleFunc("/api/article/reject", requireAuth(apiArticleReject))
+
+	// ---- 采集 / AI / 演示 ----
+	http.HandleFunc("/api/collect", requireAuth(apiCollect))
+	http.HandleFunc("/api/ai", requireRole([]string{"admin", "editor"}, apiRunAI))
+	http.HandleFunc("/api/demo/full", requireRole([]string{"admin", "leader"}, apiDemoFull))
+
+	// ---- 简报：生成 admin/leader/editor；发布 admin/leader ----
+	http.HandleFunc("/api/briefs/generate", requireRole([]string{"admin", "leader", "editor"}, apiBriefGenerate))
+	http.HandleFunc("/api/briefs/publish", requireRole([]string{"admin", "leader"}, apiBriefPublish))
+
+	// ---- wechat2rss 代理 ----
+	http.HandleFunc("/api/w2r/health", requireAuth(apiW2RHealth))
+	http.HandleFunc("/api/w2r/accounts", requireAuth(apiW2RAccounts))
+	http.HandleFunc("/api/w2r/feeds", requireAuth(apiW2RFeeds))
+	http.HandleFunc("/api/w2r/accounts/login", requireRole([]string{"admin", "editor"}, apiW2RAccountLogin))
+	http.HandleFunc("/api/w2r/accounts/code", requireRole([]string{"admin", "editor"}, apiW2RAccountCode))
+	http.HandleFunc("/api/w2r/accounts/refresh", requireRole([]string{"admin", "editor"}, apiW2RAccountRefresh))
+	http.HandleFunc("/api/w2r/accounts/del", requireRole([]string{"admin"}, apiW2RAccountDel))
+	http.HandleFunc("/api/w2r/feeds/add_url", requireRole([]string{"admin", "editor"}, apiW2RFeedAddURL))
+	http.HandleFunc("/api/w2r/feeds/add_id", requireRole([]string{"admin", "editor"}, apiW2RFeedAddID))
+	http.HandleFunc("/api/w2r/feeds/del", requireRole([]string{"admin", "editor"}, apiW2RFeedDel))
+	http.HandleFunc("/api/w2r/feeds/pause", requireRole([]string{"admin", "editor"}, apiW2RFeedPause))
+	http.HandleFunc("/api/w2r/feeds/sync", requireRole([]string{"admin", "editor"}, apiW2RFeedsSync))
 
 	indexHTML, err := assets.ReadFile("index.html")
 	if err != nil {
@@ -1791,7 +2158,7 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 }
 
 func apiStats(w http.ResponseWriter, r *http.Request) {
-	group := r.URL.Query().Get("group")
+	group := effectiveGroup(r)
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	stat := map[string]int{
@@ -1905,7 +2272,7 @@ func apiUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiSources(w http.ResponseWriter, r *http.Request) {
-	group := r.URL.Query().Get("group")
+	group := effectiveGroup(r)
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	out := []Source{}
@@ -2178,7 +2545,7 @@ func apiSourceBulkImport(w http.ResponseWriter, r *http.Request) {
 
 func apiArticles(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
-	group := r.URL.Query().Get("group")
+	group := effectiveGroup(r)
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	out := []Article{}
@@ -2496,7 +2863,7 @@ func apiBriefs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	group := r.URL.Query().Get("group")
+	group := effectiveGroup(r)
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	type bri struct {
@@ -2660,7 +3027,7 @@ func apiBriefPublish(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiPushes(w http.ResponseWriter, r *http.Request) {
-	group := r.URL.Query().Get("group")
+	group := effectiveGroup(r)
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	// 算出"属于该组"的简报集合
@@ -2692,7 +3059,7 @@ func apiPushes(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiTasks(w http.ResponseWriter, r *http.Request) {
-	group := r.URL.Query().Get("group")
+	group := effectiveGroup(r)
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	// source_id -> group
