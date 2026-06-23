@@ -2438,6 +2438,15 @@ func apiSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiBriefs(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		store.mu.Lock()
+		store.Briefs = store.Briefs[:0]
+		store.mu.Unlock()
+		store.save()
+		writeJSON(w, map[string]bool{"ok": true})
+		return
+	}
+
 	group := r.URL.Query().Get("group")
 	store.mu.RLock()
 	defer store.mu.RUnlock()
@@ -2482,11 +2491,36 @@ func apiBriefGenerate(w http.ResponseWriter, r *http.Request) {
 	store.mu.Lock()
 	now := time.Now()
 	var cutoff time.Time
+	var dayStart, dayEnd time.Time
 	var period string
 	switch t {
 	case "daily":
-		cutoff = now.Add(-7 * 24 * time.Hour) // 一周内已审核未发布的进入日报
-		period = now.Format("2006-01-02")
+		// 支持 ?date=2006-01-02 生成指定日期的日报；否则默认今天
+		if d := r.URL.Query().Get("date"); d != "" {
+			loc, _ := time.LoadLocation("Asia/Shanghai")
+			if loc == nil {
+				loc = time.Local
+			}
+			parsed, err := time.ParseInLocation("2006-01-02", d, loc)
+			if err != nil {
+				store.mu.Unlock()
+				http.Error(w, "date 格式错误，应为 2006-01-02", 400)
+				return
+			}
+			dayStart = parsed
+			dayEnd = parsed.Add(24 * time.Hour)
+			period = parsed.Format("2006-01-02")
+		} else {
+			loc, _ := time.LoadLocation("Asia/Shanghai")
+			if loc == nil {
+				loc = time.Local
+			}
+			today := now.In(loc)
+			dayStart = time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, loc)
+			dayEnd = dayStart.Add(24 * time.Hour)
+			period = dayStart.Format("2006-01-02")
+		}
+		cutoff = dayStart.Add(-3 * 24 * time.Hour) // 日报允许回溯 3 天内素材，但后续会精确到当天
 	case "weekly":
 		cutoff = now.Add(-30 * 24 * time.Hour)
 		period = fmt.Sprintf("%s 第%d周", now.Format("2006"), weekOfYear(now))
@@ -2503,6 +2537,10 @@ func apiBriefGenerate(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if a.DuplicateOf > 0 {
+			continue
+		}
+		// 日报模式下严格只取 PublishTime 落在当天 [dayStart, dayEnd) 的文章
+		if t == "daily" && (!a.PublishTime.Before(dayEnd) || a.PublishTime.Before(dayStart)) {
 			continue
 		}
 		ids = append(ids, a.ID)
