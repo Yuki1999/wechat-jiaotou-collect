@@ -18,14 +18,14 @@ const ui = reactive({
 });
 
 // ========== 当前身份（用于按组过滤）==========
-// 从 localStorage 读 + 默认综合组李审核。
+// 从 localStorage 读 + 默认综合组王审核。
 // viewAll=true 时显示全部，否则按用户的 group 过滤。
 function loadCurrentUser() {
   try {
     const raw = localStorage.getItem('dzb_user');
     if (raw) return JSON.parse(raw);
   } catch (e) {}
-  return { id: 0, name: '李审核', group: '综合组', role: 'reviewer' };
+  return { id: 0, name: '王审核', group: '综合组', role: 'reviewer' };
 }
 const currentUser = reactive(loadCurrentUser());
 const viewAll = ref(localStorage.getItem('dzb_view_all') === '1');

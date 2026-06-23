@@ -183,7 +183,7 @@ func loadStore() *Store {
 func seed(s *Store) {
 	users := []User{
 		{Name: `张主任`, Group: `综合组`, Role: "leader"},
-		{Name: `李审核`, Group: `综合组`, Role: "reviewer"},
+		{Name: `王审核`, Group: `综合组`, Role: "reviewer"},
 		{Name: `王干事`, Group: `招商组`, Role: "staff"},
 		{Name: `赵干事`, Group: `综合组`, Role: "staff"},
 		{Name: `陈干事`, Group: `专题组`, Role: "staff"},
@@ -264,7 +264,7 @@ func seed(s *Store) {
 		Title:      `党政办信息周报（模板）`,
 		Status:     "draft",
 		ArticleIDs: []int{},
-		Editor:     `李审核`,
+		Editor:     `王审核`,
 		CreatedAt:  now.Add(-24 * time.Hour),
 	})
 }
@@ -2216,7 +2216,7 @@ func apiArticleUpdate(w http.ResponseWriter, r *http.Request) {
 			after, _ := json.Marshal(store.Articles[i])
 			store.Reviews = append(store.Reviews, ReviewLog{
 				ID: store.nextID("review"), ArticleID: in.ID,
-				Reviewer: `李审核`, Action: "edit",
+				Reviewer: `王审核`, Action: "edit",
 				Before: string(before), After: string(after),
 				Note: in.Note, OccurredAt: time.Now(),
 			})
@@ -2235,7 +2235,7 @@ func apiArticleApprove(w http.ResponseWriter, r *http.Request) {
 		if store.Articles[i].ID == id {
 			store.Articles[i].Status = "approved"
 			store.Reviews = append(store.Reviews, ReviewLog{
-				ID: store.nextID("review"), ArticleID: id, Reviewer: `李审核`,
+				ID: store.nextID("review"), ArticleID: id, Reviewer: `王审核`,
 				Action: "approve", Note: `审核通过`, OccurredAt: time.Now(),
 			})
 			break
@@ -2254,7 +2254,7 @@ func apiArticleReject(w http.ResponseWriter, r *http.Request) {
 		if store.Articles[i].ID == id {
 			store.Articles[i].Status = "archived"
 			store.Reviews = append(store.Reviews, ReviewLog{
-				ID: store.nextID("review"), ArticleID: id, Reviewer: `李审核`,
+				ID: store.nextID("review"), ArticleID: id, Reviewer: `王审核`,
 				Action: "reject", Note: note, OccurredAt: time.Now(),
 			})
 			break
@@ -2512,7 +2512,7 @@ func apiBriefGenerate(w http.ResponseWriter, r *http.Request) {
 		Title:      briefTitle(t, period),
 		Status:     "draft",
 		ArticleIDs: ids,
-		Editor:     `李审核`,
+		Editor:     `王审核`,
 		CreatedAt:  now,
 	}
 	store.Briefs = append(store.Briefs, b)
@@ -2706,7 +2706,7 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 		store.Articles[c.idx].Status = "approved"
 		store.Reviews = append(store.Reviews, ReviewLog{
 			ID: store.nextID("review"), ArticleID: store.Articles[c.idx].ID,
-			Reviewer: `李审核`, Action: "approve",
+			Reviewer: `王审核`, Action: "approve",
 			Note: `[演示] 系统自动审核通过`, OccurredAt: time.Now(),
 		})
 		approved++
@@ -2738,7 +2738,7 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 		Title:      briefTitle("daily", now.Format("2006-01-02")),
 		Status:     "draft",
 		ArticleIDs: ids,
-		Editor:     `李审核`,
+		Editor:     `王审核`,
 		CreatedAt:  now,
 	}
 	store.Briefs = append(store.Briefs, brief)
