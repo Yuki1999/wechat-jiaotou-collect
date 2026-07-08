@@ -2306,8 +2306,14 @@ func main() {
 		_, _ = w.Write(indexHTML)
 	})
 
-	log.Println("党政办信息跟踪与智能整理系统 Demo 启动: http://127.0.0.1:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// 监听端口可通过 PORT 环境变量配置，默认 8080。
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "8080"
+	}
+	addr := ":" + port
+	log.Printf("党政办信息跟踪与智能整理系统启动: http://0.0.0.0:%s", port)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
