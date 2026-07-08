@@ -2,12 +2,18 @@
 # 运行时 / 二进制
 # ============================================================
 demo
+dzbdemo
 *.exe
 *.dll
 *.so
 *.dylib
 *.test
 *.out
+
+# 导出的简报 Word 文档（运行时生成）
+每日快报-*.docx
+每日快报.docx
+样例-*.docx
 
 # Go 构建中间产物
 /go-build/
@@ -29,6 +35,10 @@ deploy/wechat2rss/.env
 deploy/wechat2rss/data/
 deploy/wechat2rss/logs/
 deploy/wechat2rss/backups/
+
+# 主服务环境变量（含 W2R_TOKEN / DEEPSEEK_API_KEY 等密钥）
+.env
+.env.local
 
 # 本地 Go 工具链缓存（如使用项目内 Go）
 .gotool/
