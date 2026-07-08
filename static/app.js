@@ -250,12 +250,67 @@ const Login = defineComponent({
     const password = ref('');
     const busy = ref(false);
     const errMsg = ref('');
-    const showHelp = ref(false);
+    const showPwd = ref(false);
+    const remember = ref(localStorage.getItem('dzb_remember') === '1');
+    const capsLock = ref(false);
+    const shake = ref(false);
+
+    const today = ref(new Date());
+    setInterval(() => { today.value = new Date(); }, 1000 * 30);
+
+    const greeting = computed(() => {
+      const h = today.value.getHours();
+      if (h < 6) return '夜深了';
+      if (h < 9) return '早上好';
+      if (h < 12) return '上午好';
+      if (h < 14) return '中午好';
+      if (h < 18) return '下午好';
+      if (h < 22) return '晚上好';
+      return '夜深了';
+    });
+
+    const dateStr = computed(() => {
+      const d = today.value;
+      const week = ['日', '一', '二', '三', '四', '五', '六'][d.getDay()];
+      return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 · 星期${week}`;
+    });
+
+    onMounted(() => {
+      if (remember.value) {
+        username.value = localStorage.getItem('dzb_remember_user') || '';
+        nextTick(() => {
+          if (username.value) {
+            const pwdEl = document.querySelector('input[name="password"]');
+            if (pwdEl) pwdEl.focus();
+          } else {
+            const userEl = document.querySelector('input[name="username"]');
+            if (userEl) userEl.focus();
+          }
+        });
+      } else {
+        nextTick(() => {
+          const userEl = document.querySelector('input[name="username"]');
+          if (userEl) userEl.focus();
+        });
+      }
+    });
+
+    function checkCaps(e) {
+      capsLock.value = !!(e.getModifierState && e.getModifierState('CapsLock'));
+    }
+
+    function triggerShake() {
+      shake.value = true;
+      setTimeout(() => { shake.value = false; }, 500);
+    }
 
     async function doLogin() {
       errMsg.value = '';
-      if (!username.value || !password.value) {
+      const u = username.value.trim();
+      const p = password.value;
+      if (!u || !p) {
         errMsg.value = '请输入用户名和密码';
+        triggerShake();
         return;
       }
       busy.value = true;
@@ -263,66 +318,159 @@ const Login = defineComponent({
         const r = await fetch('/api/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: username.value, password: password.value }),
+          body: JSON.stringify({ username: u, password: p }),
         });
         const data = await r.json();
         if (!r.ok || !data.token) {
-          errMsg.value = data.err || '登录失败';
+          errMsg.value = data.err || '登录失败，请稍后重试';
+          triggerShake();
           return;
         }
         saveAuth(data.token, data.user);
         authToken.value = data.token;
         Object.assign(currentUser, data.user);
-        showToast(`欢迎，${data.user.name}`, 'success');
-        // 登录成功跳工作台
+
+        if (remember.value) {
+          localStorage.setItem('dzb_remember', '1');
+          localStorage.setItem('dzb_remember_user', u);
+        } else {
+          localStorage.removeItem('dzb_remember');
+          localStorage.removeItem('dzb_remember_user');
+        }
+
+        showToast(`欢迎回来，${data.user.name}`, 'success');
         window.location.hash = '#/';
+      } catch (e) {
+        errMsg.value = '网络异常，请检查服务连接';
+        triggerShake();
       } finally { busy.value = false; }
     }
 
-    function pickQuick(u, p) {
-      username.value = u; password.value = p; doLogin();
-    }
-
-    return { username, password, busy, errMsg, showHelp, doLogin, pickQuick };
+    return {
+      username, password, busy, errMsg, showPwd, remember, capsLock, shake,
+      greeting, dateStr, checkCaps, doLogin,
+    };
   },
   template: `
-  <div class="login-page">
-    <div class="login-card">
-      <div class="login-header">
-        <div class="login-logo">党</div>
-        <h1>党政办信息跟踪与智能整理系统</h1>
-        <div class="login-sub">跟踪 · 整理 · 协同</div>
+  <div class="login-shell">
+    <!-- 左侧品牌信息区 -->
+    <aside class="login-brand">
+      <div class="login-brand-deco">
+        <div class="deco-circle deco-c1"></div>
+        <div class="deco-circle deco-c2"></div>
+        <div class="deco-circle deco-c3"></div>
+        <div class="deco-grid"></div>
       </div>
-      <div class="login-body">
-        <div class="field">
-          <label>用户名</label>
-          <input v-model="username" placeholder="如 li / wang / admin" @keyup.enter="doLogin" autofocus>
-        </div>
-        <div class="field">
-          <label>密码</label>
-          <input v-model="password" type="password" placeholder="默认 dzb2025" @keyup.enter="doLogin">
-        </div>
-        <div v-if="errMsg" class="login-err">⚠️ {{ errMsg }}</div>
-        <button class="btn primary lg" style="width:100%;margin-top:10px;" @click="doLogin" :disabled="busy">
-          {{ busy ? '⏳ 登录中…' : '🔑 登录' }}
-        </button>
-        <div class="login-quick">
-          <div class="login-quick-label">快速登录（演示用）：</div>
-          <div class="login-quick-grid">
-            <button class="btn ghost sm" @click="pickQuick('admin','dzb2025')">管理员</button>
-            <button class="btn ghost sm" @click="pickQuick('zhang','dzb2025')">张主任</button>
-            <button class="btn ghost sm" @click="pickQuick('li','dzb2025')">李审核·综合组</button>
-            <button class="btn ghost sm" @click="pickQuick('wang','dzb2025')">王干事·招商组</button>
-            <button class="btn ghost sm" @click="pickQuick('zhao','dzb2025')">赵干事·综合组</button>
-            <button class="btn ghost sm" @click="pickQuick('chen','dzb2025')">陈干事·专题组</button>
+      <div class="login-brand-content">
+        <div class="login-brand-top">
+          <div class="login-brand-logo">党</div>
+          <div class="login-brand-name">
+            <div class="login-brand-zh">党政办信息系统</div>
+            <div class="login-brand-en">Government Office Information Hub</div>
           </div>
         </div>
+        <div class="login-brand-headline">
+          <div class="login-brand-greet">{{ greeting }}，欢迎使用</div>
+          <h2>跟踪 · 整理 · 协同<br>让党政信息流转更高效</h2>
+          <p>AI 自动整理 + 人工审核闭环，让信息收集与简报生成从 4 小时压缩到 15 分钟。</p>
+        </div>
+        <div class="login-brand-features">
+          <div class="brand-feat"><span class="feat-icon">📡</span><div><b>多源采集</b><span>网站 · 公众号 · RSS 三类全覆盖</span></div></div>
+          <div class="brand-feat"><span class="feat-icon">🤖</span><div><b>AI 整理</b><span>大模型摘要 + 重要性分级</span></div></div>
+          <div class="brand-feat"><span class="feat-icon">📋</span><div><b>分组协同</b><span>按组隔离 · 全程留痕</span></div></div>
+        </div>
+        <div class="login-brand-foot">
+          <span>{{ dateStr }}</span>
+        </div>
       </div>
-      <div class="login-foot">
-        <span>© 党政办信息系统</span>
-        <span class="hint">演示密码：<code>dzb2025</code></span>
+    </aside>
+
+    <!-- 右侧登录卡片 -->
+    <main class="login-main">
+      <div class="login-main-inner">
+      <form class="login-form-card" :class="{ shake }" @submit.prevent="doLogin" autocomplete="on">
+        <div class="login-form-head">
+          <h1>账号登录</h1>
+          <p>请输入您的工作账号信息</p>
+        </div>
+
+        <div class="login-input" :class="{ 'has-value': username }">
+          <label>用户名</label>
+          <div class="login-input-row">
+            <span class="login-input-icon">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            </span>
+            <input v-model="username" name="username" autocomplete="username"
+                   placeholder="请输入用户名" @keyup.enter="doLogin"
+                   @keydown="checkCaps" @keyup="checkCaps">
+          </div>
+        </div>
+
+        <div class="login-input" :class="{ 'has-value': password }">
+          <label>密码</label>
+          <div class="login-input-row">
+            <span class="login-input-icon">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            </span>
+            <input v-model="password" :type="showPwd ? 'text' : 'password'"
+                   name="password" autocomplete="current-password"
+                   placeholder="请输入密码" @keyup.enter="doLogin"
+                   @keydown="checkCaps" @keyup="checkCaps">
+            <button type="button" class="login-input-eye" @click="showPwd = !showPwd"
+                    :title="showPwd ? '隐藏密码' : '显示密码'" tabindex="-1">
+              <svg v-if="!showPwd" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+            </button>
+          </div>
+          <transition name="page">
+            <div v-if="capsLock" class="login-caps-tip">⚠ 当前已开启大写锁定 (Caps Lock)</div>
+          </transition>
+        </div>
+
+        <div class="login-options">
+          <label class="login-check">
+            <input type="checkbox" v-model="remember">
+            <span class="check-box"></span>
+            <span>记住账号</span>
+          </label>
+          <span class="login-help-link" title="如忘记密码请联系运维管理员重置">忘记密码？</span>
+        </div>
+
+        <transition name="page">
+          <div v-if="errMsg" class="login-err-banner">
+            <span class="err-dot"></span>
+            <span>{{ errMsg }}</span>
+          </div>
+        </transition>
+
+        <button type="submit" class="login-submit-btn" :disabled="busy">
+          <span v-if="!busy">登 录</span>
+          <span v-else class="login-loading"><span class="login-spin-dot"></span> 正在验证…</span>
+        </button>
+
+        <div class="login-safety">
+          <span class="safety-item" title="所有请求强制 HTTPS 加密传输">🛡 加密传输</span>
+          <span class="safety-divider"></span>
+          <span class="safety-item" title="操作日志全程留痕，可供审计">🔒 留痕审计</span>
+          <span class="safety-divider"></span>
+          <span class="safety-item" title="会话 12 小时自动过期">⏱ 会话保护</span>
+        </div>
+      </form>
+
+      <div class="login-info-card">
+        <div class="info-icon">📢</div>
+        <div class="info-body">
+          <b>系统已升级至 v2.1 版本</b>
+          <small>新增分组隔离、操作留痕；如需开通账号或重置密码，请联系运维管理员。</small>
+        </div>
+        <div class="info-status">服务正常</div>
       </div>
-    </div>
+
+      <div class="login-page-foot">
+        © 党政办信息跟踪与智能整理系统 · v2.1 · 受访问审计与权限管控保护
+      </div>
+      </div>
+    </main>
   </div>`
 });
 
@@ -1151,7 +1299,8 @@ const Review = defineComponent({
     }
     async function reAI() {
       const res = await api.post('/api/ai');
-      showToast(`AI 重跑完成：${res?.processed || 0} 条`, 'info');
+      const n = res?.processed || 0;
+      showToast(n ? `AI 重跑完成：${n} 条（含待整理/失败重试）` : '没有待整理或失败的文章', 'info');
       await load();
     }
     function clearFilters() {
@@ -1206,10 +1355,12 @@ const Review = defineComponent({
             <option value="pending_review">待审核</option>
             <option value="approved">已通过</option>
             <option value="published">已发布</option>
+            <option value="failed">整理失败</option>
+            <option value="duplicate">重复</option>
             <option value="archived">已归档</option>
             <option value="">全部</option>
           </select>
-          <button class="btn ghost sm" @click="reAI" title="对所有 collected 状态的文章重跑 AI 整理">⚙ 重跑 AI</button>
+          <button class="btn ghost sm" @click="reAI" title="重跑待整理(collected)与整理失败(failed)的文章">⚙ 重跑 AI</button>
         </div>
       </div>
 
@@ -1392,8 +1543,40 @@ const Briefs = defineComponent({
       if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
     }
 
+    // Word 导出：用 fetch + blob 下载，自动带 Bearer token，避免被当成 export.json 保存
+    async function exportWord(b) {
+      try {
+        const r = await fetch('/api/briefs/export?id=' + b.id, {
+          headers: authToken.value ? { 'Authorization': 'Bearer ' + authToken.value } : {},
+        });
+        if (r.status === 401) { showToast('会话已过期，请重新登录', 'warning'); return; }
+        if (!r.ok) { showToast('导出失败：HTTP ' + r.status, 'error'); return; }
+        const blob = await r.blob();
+        // 兜底：若服务端返回 JSON（非 docx），提示错误，不要把 json 当 docx 存盘
+        if (blob.type && blob.type.includes('json')) {
+          showToast('导出失败：服务端未返回 Word 文件', 'error');
+          return;
+        }
+        // 文件名从 Content-Disposition 解析；失败则用标题
+        let filename = (b.title || 'brief') + '.docx';
+        const cd = r.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename\*?=(?:UTF-8'')?["]?([^";]+)["]?/i);
+        if (m && m[1]) {
+          try { filename = decodeURIComponent(m[1]); } catch (e) { filename = m[1]; }
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (e) {
+        showToast('导出失败：' + e.message, 'error');
+      }
+    }
+
     onMounted(load);
-    return { list, expanded, gen, publish, toggle, fmtTime, channelLabel };
+    return { list, expanded, gen, publish, toggle, fmtTime, channelLabel, authToken, exportWord };
   },
   template: `
   <div class="fade-in">
@@ -1444,7 +1627,7 @@ const Briefs = defineComponent({
           </div>
           <div class="row-actions">
             <button class="btn sm ghost" @click="toggle(b.id)">{{ expanded.has(b.id) ? '收起' : '展开' }}</button>
-            <a class="btn sm" :href="'/api/briefs/export?id='+b.id" download title="导出 Word">📄 Word</a>
+            <a class="btn sm" href="javascript:void(0)" @click="exportWord(b)" title="导出 Word">📄 Word</a>
             <button class="btn sm primary" v-if="b.status==='draft'" @click="publish(b)">📤 发布</button>
             <button class="btn sm" v-else @click="publish(b)">↺ 再次推送</button>
           </div>

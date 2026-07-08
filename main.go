@@ -107,6 +107,7 @@ type Brief struct {
 	Title       string    `json:"title"`
 	Status      string    `json:"status"`
 	ArticleIDs  []int     `json:"article_ids"`
+	Overview    string    `json:"overview"` // AI 生成的本期综述（公文编者按），分析性内容
 	Editor      string    `json:"editor"`
 	CreatedAt   time.Time `json:"created_at"`
 	PublishedAt time.Time `json:"published_at,omitempty"`
@@ -160,25 +161,44 @@ func (s *Store) nextID(k string) int {
 
 const dataFile = "data.json"
 
-// save 必须在调用方已经持有锁（或不在锁内）的前提下调用：
-// 它自身不再获取锁，避免与外层 Lock 形成死锁。调用顺序约定：
-//   store.mu.Lock(); ...修改...; store.mu.Unlock(); store.save()
-func (s *Store) save() {
-	b, _ := json.MarshalIndent(s, "", "  ")
-	_ = os.WriteFile(dataFile, b, 0644)
-}
-
+// loadStore 连接 PostgreSQL 并把数据装入内存快照：
+//   - 首次启动（库为空）：优先从旧 data.json 一次性迁移导入，否则播种种子数据；
+//   - 之后：直接从库中读取。
+// 持久化改为「定向写入」——各写操作直接落库（见 db.go 的 dbUpsert*/dbInsert*），
+// 不再有全量 JSON 重写。内存快照仅用于读路径。
 func loadStore() *Store {
-	s := &Store{NextIDs: map[string]int{}}
-	if b, err := os.ReadFile(dataFile); err == nil {
-		_ = json.Unmarshal(b, s)
-		if s.NextIDs == nil {
-			s.NextIDs = map[string]int{}
-		}
-		return s
+	ctx := context.Background()
+	if err := initDB(ctx); err != nil {
+		log.Fatalf("[db] 初始化失败: %v", err)
 	}
-	seed(s)
-	s.save()
+	n, err := dbRowCount(ctx, "users")
+	if err != nil {
+		log.Fatalf("[db] 探测数据失败: %v", err)
+	}
+	if n == 0 {
+		if b, err := os.ReadFile(dataFile); err == nil {
+			tmp := &Store{NextIDs: map[string]int{}}
+			if err := json.Unmarshal(b, tmp); err != nil {
+				log.Fatalf("[db] 解析 data.json 失败: %v", err)
+			}
+			log.Printf("[db] 检测到 data.json，执行一次性迁移导入…")
+			if err := persistFullSnapshot(tmp); err != nil {
+				log.Fatalf("[db] 迁移导入失败: %v", err)
+			}
+		} else {
+			seedStore := &Store{NextIDs: map[string]int{}}
+			seed(seedStore)
+			if err := persistFullSnapshot(seedStore); err != nil {
+				log.Fatalf("[db] 播种落库失败: %v", err)
+			}
+		}
+	}
+	s, err := loadStoreFromDB(ctx)
+	if err != nil {
+		log.Fatalf("[db] 装载数据失败: %v", err)
+	}
+	log.Printf("[db] 数据已装载：users=%d sources=%d articles=%d briefs=%d",
+		len(s.Users), len(s.Sources), len(s.Articles), len(s.Briefs))
 	return s
 }
 
@@ -188,7 +208,7 @@ func loadStore() *Store {
 
 func seed(s *Store) {
 	// 演示默认密码（生产环境务必修改）
-	defPwHash := sha256hex("dzb2025")
+	defPwHash := sha256full("dzb2025")
 	users := []User{
 		{Name: `张主任`, Username: "zhang", Group: `综合组`, Role: "leader"},
 		{Name: `李审核`, Username: "li", Group: `综合组`, Role: "reviewer"},
@@ -503,6 +523,12 @@ func parseFlexibleTime(s string) time.Time {
 func sha256hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])[:16]
+}
+
+// sha256full 完整 64 位 sha256 hex，用于密码哈希
+func sha256full(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
 }
 
 // ----- RSS / Atom 解析（用于 wechat2rss 与通用 RSS） -----
@@ -846,8 +872,11 @@ func runSchedulerTick() {
 		}
 		tr := runOneCollect(store, src)
 		store.Tasks = append(store.Tasks, tr)
+		srcCopy := *src
 		store.mu.Unlock()
-		store.save()
+		// 采集到的文章已在 ingestArticle 内落库；此处持久化信息源状态与任务日志。
+		dbUpsertSource(srcCopy)
+		dbInsertTask(tr)
 		log.Printf("[scheduler] %s → %s (found=%d new=%d)", c.unit, tr.Status, tr.Found, tr.NewItems)
 		// 礼貌停顿，避免对同一目标站短时间内打太密
 		time.Sleep(1 * time.Second)
@@ -933,8 +962,7 @@ func collectHTMLViaCrawler(ctx context.Context, s *Store, src *Source, tr TaskRu
 			Status:      "collected", Category: src.Category,
 			OwnerID: src.OwnerID, OwnerName: src.OwnerName, Group: src.Group,
 		}
-		runOneAI(&a)
-		s.Articles = append(s.Articles, a)
+		ingestArticle(s, a)
 		newCount++
 	}
 	tr.NewItems = newCount
@@ -990,8 +1018,7 @@ func collectHTMLRegex(ctx context.Context, s *Store, src *Source, tr TaskRun) Ta
 			Status:      "collected", Category: src.Category,
 			OwnerID: src.OwnerID, OwnerName: src.OwnerName, Group: src.Group,
 		}
-		runOneAI(&a)
-		s.Articles = append(s.Articles, a)
+		ingestArticle(s, a)
 		newCount++
 	}
 	tr.NewItems = newCount
@@ -1035,8 +1062,7 @@ func collectRSS(ctx context.Context, s *Store, src *Source, tr TaskRun) TaskRun 
 			Status:      "collected", Category: src.Category,
 			OwnerID: src.OwnerID, OwnerName: src.OwnerName, Group: src.Group,
 		}
-		runOneAI(&a)
-		s.Articles = append(s.Articles, a)
+		ingestArticle(s, a)
 		newCount++
 	}
 	tr.NewItems = newCount
@@ -1052,6 +1078,35 @@ func failTask(s *Store, src *Source, tr TaskRun, msg string) TaskRun {
 	tr.FinishedAt = time.Now()
 	src.FailCount++
 	return tr
+}
+
+// findDuplicateID 跨信息源按 ContentHash 查重：命中已有的"非重复"文章则返回其 ID，否则返回 0。
+// 用于识别不同公众号/网站转载同一篇内容（URL 不同但正文相同）的情形。
+func findDuplicateID(s *Store, hash string) int {
+	if hash == "" {
+		return 0
+	}
+	for i := range s.Articles {
+		if s.Articles[i].ContentHash == hash && s.Articles[i].DuplicateOf == 0 {
+			return s.Articles[i].ID
+		}
+	}
+	return 0
+}
+
+// ingestArticle 统一入库：先跨源查重，命中则标记为 duplicate 且跳过 AI（省 token），
+// 否则内联跑 AI 整理。三个采集通道（crawler / 正则 / RSS）共用。
+func ingestArticle(s *Store, a Article) {
+	if dupID := findDuplicateID(s, a.ContentHash); dupID > 0 {
+		a.DuplicateOf = dupID
+		a.Status = "duplicate"
+		a.AIEngine = ""
+		a.Evidence = fmt.Sprintf("与文章 #%d 内容重复，自动跳过整理", dupID)
+	} else {
+		runOneAI(&a)
+	}
+	s.Articles = append(s.Articles, a)
+	dbUpsertArticle(a) // 定向落库
 }
 
 // ===================== AI 整理 =====================
@@ -1245,6 +1300,100 @@ func runOneAIDeepSeek(a *Article) error {
 	a.Evidence = fmt.Sprintf("由 %s 整理 · tokens=%d", deepseekModel, apiResp.Usage.TotalTokens)
 	a.Confidence = 0.95
 	return nil
+}
+
+// briefEntry 供综述生成使用的精简条目。
+type briefEntry struct {
+	Importance, Unit, Title, Summary string
+}
+
+// deepseekChatText 通用文本补全：单轮 user prompt，返回纯文本（非 JSON）。
+func deepseekChatText(prompt string, maxTokens int) (string, error) {
+	if deepseekKey == "" {
+		return "", fmt.Errorf("DEEPSEEK_API_KEY 未配置")
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"model":       deepseekModel,
+		"messages":    []map[string]string{{"role": "user", "content": prompt}},
+		"temperature": 0.4,
+		"max_tokens":  maxTokens,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", deepseekBase+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+deepseekKey)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 50 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, trunc(string(respBody), 200))
+	}
+	var apiResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return "", err
+	}
+	if apiResp.Error.Message != "" {
+		return "", fmt.Errorf("api error: %s", apiResp.Error.Message)
+	}
+	if len(apiResp.Choices) == 0 || apiResp.Choices[0].Message.Content == "" {
+		return "", fmt.Errorf("empty content")
+	}
+	return apiResp.Choices[0].Message.Content, nil
+}
+
+// generateBriefOverview 对本期全部条目做综合研判，输出公文风格「本期综述」。
+// 失败时返回空串——导出端据此跳过综述段，不影响主流程。
+func generateBriefOverview(briefType string, entries []briefEntry) string {
+	if deepseekKey == "" || len(entries) == 0 {
+		return ""
+	}
+	label := map[string]string{"daily": "每日快报", "weekly": "信息周报", "monthly": "月度汇编"}[briefType]
+	if label == "" {
+		label = "信息简报"
+	}
+	var sb strings.Builder
+	for i, e := range entries {
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s（%s）：%s\n", i+1, e.Importance, e.Title, e.Unit, e.Summary))
+	}
+	prompt := fmt.Sprintf(`你是党政办资深信息员。以下是本期《%s》收录的全部信息条目。请撰写一段"本期综述"，置于简报开头作编者按之用。
+
+要求：
+- 公文风格，客观凝练，平实准确，不堆砌辞藻、不空喊口号；
+- 不要逐条复述，而要归纳本期总体态势、提炼重点亮点、串联工作脉络，并作简要研判或工作提示；
+- 200—320字，单段成文，不分点、不加小标题、不加引号；
+- 直接输出综述正文，不要任何前后缀说明。
+
+本期条目：
+%s`, label, sb.String())
+
+	txt, err := deepseekChatText(prompt, 900)
+	if err != nil {
+		log.Printf("[ai] 本期综述生成失败: %v", err)
+		return ""
+	}
+	txt = strings.TrimSpace(txt)
+	// 去掉模型偶尔自带的"本期综述："前缀或引号
+	txt = strings.TrimPrefix(txt, "本期综述：")
+	txt = strings.TrimPrefix(txt, "本期综述:")
+	txt = strings.Trim(txt, "“”\"")
+	return strings.TrimSpace(txt)
 }
 
 // runOneAIRule 原本的本地规则引擎，作为兜底。
@@ -1595,7 +1744,7 @@ func apiAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"err": "该账号已被禁用，请联系管理员", "code": "user_disabled"})
 		return
 	}
-	if found.PasswordHash != sha256hex(in.Password) {
+	if found.PasswordHash != sha256full(in.Password) {
 		sessions.recordFailure(in.Username)
 		w.WriteHeader(401)
 		writeJSON(w, map[string]string{"err": "密码错误", "code": "wrong_password"})
@@ -1604,14 +1753,16 @@ func apiAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 	sessions.clearFailures(in.Username)
 	// 更新 last_login
+	var updated User
 	store.mu.Lock()
 	for i := range store.Users {
 		if store.Users[i].ID == found.ID {
 			store.Users[i].LastLoginAt = time.Now()
+			updated = store.Users[i]
 		}
 	}
 	store.mu.Unlock()
-	store.save()
+	dbUpsertUser(updated)
 
 	sess := sessions.issue(*found)
 	writeJSON(w, map[string]interface{}{
@@ -1671,20 +1822,23 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"err": "新密码长度至少 6 位"})
 		return
 	}
+	var updated User
 	store.mu.Lock()
-	defer store.mu.Unlock()
 	for i := range store.Users {
 		if store.Users[i].ID == s.UserID {
-			if store.Users[i].PasswordHash != sha256hex(in.OldPassword) {
+			if store.Users[i].PasswordHash != sha256full(in.OldPassword) {
+				store.mu.Unlock()
 				w.WriteHeader(400)
 				writeJSON(w, map[string]string{"err": "原密码错误"})
 				return
 			}
-			store.Users[i].PasswordHash = sha256hex(in.NewPassword)
+			store.Users[i].PasswordHash = sha256full(in.NewPassword)
+			updated = store.Users[i]
 			break
 		}
 	}
-	store.save()
+	store.mu.Unlock()
+	dbUpsertUser(updated)
 	writeJSON(w, map[string]string{"ok": "1"})
 }
 
@@ -2029,6 +2183,7 @@ func apiW2RFeedsSync(w http.ResponseWriter, r *http.Request) {
 	// 真正写入
 	store.mu.Lock()
 	created, skipped := 0, 0
+	newSources := []Source{}
 	now := time.Now()
 	for _, it := range items {
 		if it.Status == "exists" {
@@ -2050,10 +2205,13 @@ func apiW2RFeedsSync(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:  now,
 		}
 		store.Sources = append(store.Sources, s)
+		newSources = append(newSources, s)
 		created++
 	}
 	store.mu.Unlock()
-	store.save()
+	for _, s := range newSources {
+		dbUpsertSource(s)
+	}
 
 	writeJSON(w, map[string]interface{}{
 		"items":   items,
@@ -2304,21 +2462,27 @@ func apiSourceCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	store.Sources = append(store.Sources, s)
 	store.mu.Unlock()
-	store.save()
+	dbUpsertSource(s)
 	writeJSON(w, s)
 }
 
 func apiSourceToggle(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+	var updated Source
+	found := false
 	store.mu.Lock()
 	for i := range store.Sources {
 		if store.Sources[i].ID == id {
 			store.Sources[i].Active = !store.Sources[i].Active
+			updated = store.Sources[i]
+			found = true
 			break
 		}
 	}
 	store.mu.Unlock()
-	store.save()
+	if found {
+		dbUpsertSource(updated)
+	}
 	writeJSON(w, map[string]string{"ok": "1"})
 }
 
@@ -2337,11 +2501,11 @@ func apiSourceDelete(w http.ResponseWriter, r *http.Request) {
 		store.Sources = append(store.Sources[:idx], store.Sources[idx+1:]...)
 	}
 	store.mu.Unlock()
-	store.save()
 	if idx < 0 {
 		http.Error(w, "not found", 404)
 		return
 	}
+	dbDeleteSource(id)
 	writeJSON(w, map[string]string{"ok": "1"})
 }
 
@@ -2505,6 +2669,7 @@ func apiSourceBulkImport(w http.ResponseWriter, r *http.Request) {
 		exists[s.URL] = true
 	}
 	created, skipped := 0, 0
+	newSources := []Source{}
 	now := time.Now()
 	for _, s := range in.Items {
 		if s.URL == "" || exists[s.URL] {
@@ -2531,11 +2696,14 @@ func apiSourceBulkImport(w http.ResponseWriter, r *http.Request) {
 		s.Active = true
 		s.CreatedAt = now
 		store.Sources = append(store.Sources, s)
+		newSources = append(newSources, s)
 		exists[s.URL] = true
 		created++
 	}
 	store.mu.Unlock()
-	store.save()
+	for _, s := range newSources {
+		dbUpsertSource(s)
+	}
 	writeJSON(w, map[string]int{
 		"created": created,
 		"skipped": skipped,
@@ -2621,6 +2789,9 @@ func apiArticleUpdate(w http.ResponseWriter, r *http.Request) {
 		Note          string `json:"note"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&in)
+	var updatedArt Article
+	var rv ReviewLog
+	found := false
 	store.mu.Lock()
 	for i := range store.Articles {
 		if store.Articles[i].ID == in.ID {
@@ -2630,54 +2801,78 @@ func apiArticleUpdate(w http.ResponseWriter, r *http.Request) {
 			store.Articles[i].DetailSummary = in.DetailSummary
 			store.Articles[i].Importance = in.Importance
 			after, _ := json.Marshal(store.Articles[i])
-			store.Reviews = append(store.Reviews, ReviewLog{
+			rv = ReviewLog{
 				ID: store.nextID("review"), ArticleID: in.ID,
 				Reviewer: `王审核`, Action: "edit",
 				Before: string(before), After: string(after),
 				Note: in.Note, OccurredAt: time.Now(),
-			})
+			}
+			store.Reviews = append(store.Reviews, rv)
+			updatedArt = store.Articles[i]
+			found = true
 			break
 		}
 	}
 	store.mu.Unlock()
-	store.save()
+	if found {
+		dbUpsertArticle(updatedArt)
+		dbInsertReview(rv)
+	}
 	writeJSON(w, map[string]string{"ok": "1"})
 }
 
 func apiArticleApprove(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+	var updatedArt Article
+	var rv ReviewLog
+	found := false
 	store.mu.Lock()
 	for i := range store.Articles {
 		if store.Articles[i].ID == id {
 			store.Articles[i].Status = "approved"
-			store.Reviews = append(store.Reviews, ReviewLog{
+			rv = ReviewLog{
 				ID: store.nextID("review"), ArticleID: id, Reviewer: `王审核`,
 				Action: "approve", Note: `审核通过`, OccurredAt: time.Now(),
-			})
+			}
+			store.Reviews = append(store.Reviews, rv)
+			updatedArt = store.Articles[i]
+			found = true
 			break
 		}
 	}
 	store.mu.Unlock()
-	store.save()
+	if found {
+		dbUpsertArticle(updatedArt)
+		dbInsertReview(rv)
+	}
 	writeJSON(w, map[string]string{"ok": "1"})
 }
 
 func apiArticleReject(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
 	note := r.URL.Query().Get("note")
+	var updatedArt Article
+	var rv ReviewLog
+	found := false
 	store.mu.Lock()
 	for i := range store.Articles {
 		if store.Articles[i].ID == id {
 			store.Articles[i].Status = "archived"
-			store.Reviews = append(store.Reviews, ReviewLog{
+			rv = ReviewLog{
 				ID: store.nextID("review"), ArticleID: id, Reviewer: `王审核`,
 				Action: "reject", Note: note, OccurredAt: time.Now(),
-			})
+			}
+			store.Reviews = append(store.Reviews, rv)
+			updatedArt = store.Articles[i]
+			found = true
 			break
 		}
 	}
 	store.mu.Unlock()
-	store.save()
+	if found {
+		dbUpsertArticle(updatedArt)
+		dbInsertReview(rv)
+	}
 	writeJSON(w, map[string]string{"ok": "1"})
 }
 
@@ -2685,6 +2880,7 @@ func apiCollect(w http.ResponseWriter, r *http.Request) {
 	idStr := r.URL.Query().Get("id")
 	store.mu.Lock()
 	results := []TaskRun{}
+	touchedSources := []Source{}
 	if idStr != "" {
 		id, _ := strconv.Atoi(idStr)
 		for i := range store.Sources {
@@ -2692,6 +2888,7 @@ func apiCollect(w http.ResponseWriter, r *http.Request) {
 				tr := runOneCollect(store, &store.Sources[i])
 				store.Tasks = append(store.Tasks, tr)
 				results = append(results, tr)
+				touchedSources = append(touchedSources, store.Sources[i])
 				break
 			}
 		}
@@ -2703,10 +2900,17 @@ func apiCollect(w http.ResponseWriter, r *http.Request) {
 			tr := runOneCollect(store, &store.Sources[i])
 			store.Tasks = append(store.Tasks, tr)
 			results = append(results, tr)
+			touchedSources = append(touchedSources, store.Sources[i])
 		}
 	}
 	store.mu.Unlock()
-	store.save()
+	// 采集到的文章已在 ingestArticle 内落库；此处持久化信息源状态与任务日志。
+	for _, s := range touchedSources {
+		dbUpsertSource(s)
+	}
+	for _, tr := range results {
+		dbInsertTask(tr)
+	}
 	writeJSON(w, results)
 }
 
@@ -2755,10 +2959,15 @@ func runAIBatch(targetStatuses []string) (int, map[string]int) {
 			runOneAI(&a)
 
 			store.mu.Lock()
+			written := false
 			if i < len(store.Articles) && store.Articles[i].ID == a.ID {
 				store.Articles[i] = a
+				written = true
 			}
 			store.mu.Unlock()
+			if written {
+				dbUpsertArticle(a) // 定向落库
+			}
 
 			mu.Lock()
 			engineCounts[a.AIEngine]++
@@ -2766,16 +2975,16 @@ func runAIBatch(targetStatuses []string) (int, map[string]int) {
 		}(idx)
 	}
 	wg.Wait()
-	store.save()
 	return len(indices), engineCounts
 }
 
 func apiRunAI(w http.ResponseWriter, r *http.Request) {
-	// 支持 ?all=1 重跑所有文章（不限状态），用于批量重跑演示数据
+	// 默认重跑 collected（新采集待整理）+ failed（上次 AI 失败，给一次重试机会）；
+	// ?all=1 额外把 pending_review / ai_done 也一并重跑（用于批量重刷演示数据）。
 	all := r.URL.Query().Get("all") == "1"
-	statuses := []string{"collected"}
+	statuses := []string{"collected", "failed"}
 	if all {
-		statuses = []string{"collected", "pending_review", "ai_done"}
+		statuses = []string{"collected", "failed", "pending_review", "ai_done"}
 	}
 	count, engines := runAIBatch(statuses)
 	writeJSON(w, map[string]interface{}{
@@ -2858,7 +3067,7 @@ func apiBriefs(w http.ResponseWriter, r *http.Request) {
 		store.mu.Lock()
 		store.Briefs = store.Briefs[:0]
 		store.mu.Unlock()
-		store.save()
+		dbDeleteAllBriefs()
 		writeJSON(w, map[string]bool{"ok": true})
 		return
 	}
@@ -2945,6 +3154,7 @@ func apiBriefGenerate(w http.ResponseWriter, r *http.Request) {
 		period = now.Format("2006-01")
 	}
 	ids := []int{}
+	entries := []briefEntry{}
 	for _, a := range store.Articles {
 		if a.PublishTime.Before(cutoff) {
 			continue
@@ -2960,19 +3170,57 @@ func apiBriefGenerate(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		ids = append(ids, a.ID)
+		sum := a.LeaderSummary
+		if sum == "" {
+			sum = a.DetailSummary
+		}
+		entries = append(entries, briefEntry{Importance: a.Importance, Unit: a.Unit, Title: a.Title, Summary: sum})
 	}
+	bid := store.nextID("brief")
+	store.mu.Unlock()
+
+	// 综述调用 DeepSeek（耗时数秒），放在锁外，避免阻塞其他请求。
+	overview := generateBriefOverview(t, entries)
+
 	b := Brief{
-		ID: store.nextID("brief"), Type: t, Period: period,
+		ID: bid, Type: t, Period: period,
 		Title:      briefTitle(t, period),
 		Status:     "draft",
 		ArticleIDs: ids,
+		Overview:   overview,
 		Editor:     `王审核`,
 		CreatedAt:  now,
 	}
+	store.mu.Lock()
 	store.Briefs = append(store.Briefs, b)
 	store.mu.Unlock()
-	store.save()
+	dbUpsertBrief(b)
 	writeJSON(w, b)
+}
+
+// cnNum 将阿拉伯数字转为公文常用的中文序号（一、二……二十一）。
+func cnNum(n int) string {
+	digits := []string{"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"}
+	if n <= 0 {
+		return strconv.Itoa(n)
+	}
+	if n < 10 {
+		return digits[n]
+	}
+	if n < 20 {
+		if n == 10 {
+			return "十"
+		}
+		return "十" + digits[n%10]
+	}
+	if n < 100 {
+		s := digits[n/10] + "十"
+		if n%10 != 0 {
+			s += digits[n%10]
+		}
+		return s
+	}
+	return strconv.Itoa(n)
 }
 
 func briefTitle(t, period string) string {
@@ -3002,10 +3250,12 @@ func apiBriefPublish(w http.ResponseWriter, r *http.Request) {
 		if store.Briefs[i].ID == id {
 			store.Briefs[i].Status = "published"
 			store.Briefs[i].PublishedAt = time.Now()
+			publishedArts := []Article{}
 			for _, aid := range store.Briefs[i].ArticleIDs {
 				for j := range store.Articles {
 					if store.Articles[j].ID == aid && store.Articles[j].Status == "approved" {
 						store.Articles[j].Status = "published"
+						publishedArts = append(publishedArts, store.Articles[j])
 					}
 				}
 			}
@@ -3016,8 +3266,14 @@ func apiBriefPublish(w http.ResponseWriter, r *http.Request) {
 			}
 			// Demo: 不模拟随机失败，保证演示链路稳定
 			store.Pushes = append(store.Pushes, pl)
+			briefCopy := store.Briefs[i]
 			store.mu.Unlock()
-			store.save()
+			// 定向落库：简报状态、被发布文章状态、推送日志
+			dbUpsertBrief(briefCopy)
+			for _, a := range publishedArts {
+				dbUpsertArticle(a)
+			}
+			dbInsertPush(pl)
 			writeJSON(w, pl)
 			return
 		}
@@ -3103,6 +3359,7 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 	// 1) 全量采集
 	store.mu.Lock()
 	collectResults := []TaskRun{}
+	touchedSources := []Source{}
 	for i := range store.Sources {
 		if !store.Sources[i].Active {
 			continue
@@ -3110,9 +3367,15 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 		tr := runOneCollect(store, &store.Sources[i])
 		store.Tasks = append(store.Tasks, tr)
 		collectResults = append(collectResults, tr)
+		touchedSources = append(touchedSources, store.Sources[i])
 	}
 	store.mu.Unlock()
-	store.save()
+	for _, s := range touchedSources {
+		dbUpsertSource(s)
+	}
+	for _, tr := range collectResults {
+		dbInsertTask(tr)
+	}
 	okCount, newTotal := 0, 0
 	for _, t := range collectResults {
 		if t.Status == "success" {
@@ -3153,20 +3416,30 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 	// 倒序时间挑前 8 条
 	sort.Slice(cands, func(i, j int) bool { return cands[i].t.After(cands[j].t) })
 	approved := 0
+	approvedArts := []Article{}
+	approvedReviews := []ReviewLog{}
 	for _, c := range cands {
 		if approved >= 8 {
 			break
 		}
 		store.Articles[c.idx].Status = "approved"
-		store.Reviews = append(store.Reviews, ReviewLog{
+		rv := ReviewLog{
 			ID: store.nextID("review"), ArticleID: store.Articles[c.idx].ID,
 			Reviewer: `王审核`, Action: "approve",
 			Note: `[演示] 系统自动审核通过`, OccurredAt: time.Now(),
-		})
+		}
+		store.Reviews = append(store.Reviews, rv)
+		approvedArts = append(approvedArts, store.Articles[c.idx])
+		approvedReviews = append(approvedReviews, rv)
 		approved++
 	}
 	store.mu.Unlock()
-	store.save()
+	for _, a := range approvedArts {
+		dbUpsertArticle(a)
+	}
+	for _, rv := range approvedReviews {
+		dbInsertReview(rv)
+	}
 	add(3, "人工审核", true, fmt.Sprintf("近 7 天高/中重要性条目，已通过 %d 条（演示自动）", approved))
 
 	// 4) 生成日报
@@ -3198,10 +3471,14 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 	store.Briefs = append(store.Briefs, brief)
 	briefID := brief.ID
 	store.mu.Unlock()
-	store.save()
+	dbUpsertBrief(brief)
 	add(4, "生成日报", len(ids) > 0, fmt.Sprintf("「%s」 共 %d 条入选", brief.Title, len(ids)))
 
 	// 5) 推送（模拟企微）
+	var pubBrief Brief
+	pubArts := []Article{}
+	var pubPush PushLog
+	pubDone := false
 	store.mu.Lock()
 	for i := range store.Briefs {
 		if store.Briefs[i].ID == briefID {
@@ -3211,6 +3488,7 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 				for j := range store.Articles {
 					if store.Articles[j].ID == aid && store.Articles[j].Status == "approved" {
 						store.Articles[j].Status = "published"
+						pubArts = append(pubArts, store.Articles[j])
 					}
 				}
 			}
@@ -3220,11 +3498,20 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 				Status: "success", ReturnCode: "0", OccurredAt: time.Now(),
 			}
 			store.Pushes = append(store.Pushes, pl)
+			pubBrief = store.Briefs[i]
+			pubPush = pl
+			pubDone = true
 			break
 		}
 	}
 	store.mu.Unlock()
-	store.save()
+	if pubDone {
+		dbUpsertBrief(pubBrief)
+		for _, a := range pubArts {
+			dbUpsertArticle(a)
+		}
+		dbInsertPush(pubPush)
+	}
 	add(5, "企微推送", true, "（模拟）已通过「应用消息」推送给张主任，返回码 0")
 
 	writeJSON(w, out)
@@ -3249,13 +3536,23 @@ func apiBriefExport(w http.ResponseWriter, r *http.Request) {
 	}
 	// 收集条目
 	type briefItem = struct {
-		Importance, Unit, Title, LeaderSummary, URL string
+		Importance, Unit, Title, LeaderSummary, DetailSummary, Category, URL string
+		PublishTime                                                          time.Time
 	}
 	items := []briefItem{}
 	for _, aid := range brief.ArticleIDs {
 		for _, a := range store.Articles {
 			if a.ID == aid {
-				items = append(items, briefItem{a.Importance, a.Unit, a.Title, a.LeaderSummary, a.URL})
+				items = append(items, briefItem{
+					Importance:    a.Importance,
+					Unit:          a.Unit,
+					Title:         a.Title,
+					LeaderSummary: a.LeaderSummary,
+					DetailSummary: a.DetailSummary,
+					Category:      a.Category,
+					URL:           a.URL,
+					PublishTime:   a.PublishTime,
+				})
 				break
 			}
 		}
@@ -3263,6 +3560,7 @@ func apiBriefExport(w http.ResponseWriter, r *http.Request) {
 	title := brief.Title
 	period := brief.Period
 	editor := brief.Editor
+	overview := brief.Overview
 	store.mu.RUnlock()
 
 	// 按重要性排序
@@ -3272,7 +3570,7 @@ func apiBriefExport(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// 生成 docx —— 简单结构：[Content_Types].xml / _rels/.rels / word/document.xml
-	docXML := buildDocxBody(title, period, editor, items)
+	docXML := buildDocxBody(title, period, editor, overview, items)
 	docxBytes, err := zipDocx(docXML)
 	if err != nil {
 		http.Error(w, "export failed: "+err.Error(), 500)
@@ -3284,63 +3582,259 @@ func apiBriefExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(docxBytes)
 }
 
-func buildDocxBody(title, period, editor string, items []struct {
-	Importance, Unit, Title, LeaderSummary, URL string
+func buildDocxBody(title, period, editor, overview string, items []struct {
+	Importance, Unit, Title, LeaderSummary, DetailSummary, Category, URL string
+	PublishTime                                                          time.Time
 }) string {
+	// ---------------- XML 转义 ----------------
 	esc := func(s string) string {
 		s = strings.ReplaceAll(s, "&", "&amp;")
 		s = strings.ReplaceAll(s, "<", "&lt;")
 		s = strings.ReplaceAll(s, ">", "&gt;")
+		s = strings.ReplaceAll(s, "\"", "&quot;")
 		return s
 	}
-	p := func(text string, opts ...string) string {
-		var pPr, rPr string
-		for _, o := range opts {
-			switch o {
-			case "title":
-				pPr = `<w:pPr><w:jc w:val="center"/></w:pPr>`
-				rPr = `<w:rPr><w:b/><w:sz w:val="36"/><w:color w:val="B32424"/></w:rPr>`
-			case "h2":
-				rPr = `<w:rPr><w:b/><w:sz w:val="26"/><w:color w:val="8C1C1C"/></w:rPr>`
-			case "meta":
-				rPr = `<w:rPr><w:color w:val="6B7280"/><w:sz w:val="20"/></w:rPr>`
-			case "bold":
-				rPr = `<w:rPr><w:b/></w:rPr>`
-			}
-		}
-		return "<w:p>" + pPr + "<w:r>" + rPr + "<w:t xml:space=\"preserve\">" + esc(text) + "</w:t></w:r></w:p>"
+
+	// ---------------- 基础段落原语 ----------------
+	// 字体规范：
+	//   标题：方正小标宋 / 小标宋_GBK，44 半磅 = 22pt，红色 C00000
+	//   一级标题：黑体，32 半磅 = 16pt
+	//   正文：仿宋_GB2312，正文 32 半磅（小四 12pt）；公文标准三号 = 32 半磅
+	//   行距：固定值 28 磅 = 560 第二十分之磅；首行缩进 2 字符 = 480 twips
+	font := func(asciiHCS string) string {
+		// w:rFonts —— ascii 拉丁字体，eastAsia 东亚字体
+		return fmt.Sprintf(`<w:rFonts w:ascii="%s" w:hAnsi="%s" w:eastAsia="%s" w:cs="%s"/>`, asciiHCS, asciiHCS, asciiHCS, asciiHCS)
 	}
 
-	body := p(title, "title")
-	body += p("期次："+period+"     编辑："+editor+"     生成时间："+time.Now().Format("2006-01-02 15:04"), "meta")
-	body += p("", "")
-	body += p("一、要点摘要", "h2")
-	highCount, midCount := 0, 0
+	// 通用段落：text / 字号(半磅) / 字体 / 颜色 / 粗体 / 居中 / 首行缩进 / 行距
+	makeP := func(text, fontName string, sz int, color string, bold, center, indent bool, lineRule string) string {
+		var pPr, rPr strings.Builder
+		pPr.WriteString("<w:pPr>")
+		// 行距：固定 28 磅；line=560；lineRule=exact 表示行距是固定值
+		if lineRule == "" {
+			lineRule = "exact"
+		}
+		pPr.WriteString(fmt.Sprintf(`<w:spacing w:line="560" w:lineRule="%s" w:before="0" w:after="0"/>`, lineRule))
+		if center {
+			pPr.WriteString(`<w:jc w:val="center"/>`)
+		}
+		if indent {
+			// firstLineChars=200 = 2 字符缩进
+			pPr.WriteString(`<w:ind w:firstLineChars="200" w:firstLine="640"/>`)
+		}
+		pPr.WriteString("</w:pPr>")
+		rPr.WriteString("<w:rPr>")
+		rPr.WriteString(font(fontName))
+		if sz > 0 {
+			rPr.WriteString(fmt.Sprintf(`<w:sz w:val="%d"/><w:szCs w:val="%d"/>`, sz, sz))
+		}
+		if color != "" {
+			rPr.WriteString(fmt.Sprintf(`<w:color w:val="%s"/>`, color))
+		}
+		if bold {
+			rPr.WriteString(`<w:b/><w:bCs/>`)
+		}
+		rPr.WriteString("</w:rPr>")
+		// 文本节点，xml:space="preserve" 保留前后空格
+		return "<w:p>" + pPr.String() + "<w:r>" + rPr.String() + `<w:t xml:space="preserve">` + esc(text) + "</w:t></w:r></w:p>"
+	}
+
+	// 空行（行距还是 28 磅）
+	emptyP := func() string {
+		return `<w:p><w:pPr><w:spacing w:line="560" w:lineRule="exact"/></w:pPr></w:p>`
+	}
+
+	// 红色横线（pBdr 下边框 + 短段落）
+	redLine := func() string {
+		return `<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="18" w:space="1" w:color="C00000"/></w:pBdr><w:spacing w:line="120" w:lineRule="exact"/></w:pPr></w:p>`
+	}
+
+	// 目录行：左侧条目标题，右侧用前导点 + 制表位对齐供稿单位（公文目录样式）
+	catalogRow := func(title, unit string) string {
+		return `<w:p><w:pPr><w:spacing w:line="440" w:lineRule="exact"/>` +
+			`<w:ind w:firstLineChars="200" w:firstLine="560"/>` +
+			`<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="8500"/></w:tabs></w:pPr>` +
+			`<w:r><w:rPr>` + font("仿宋_GB2312") + `<w:sz w:val="28"/><w:szCs w:val="28"/><w:color w:val="404040"/></w:rPr>` +
+			`<w:t xml:space="preserve">` + esc(title) + `</w:t></w:r>` +
+			`<w:r><w:tab/></w:r>` +
+			`<w:r><w:rPr>` + font("仿宋_GB2312") + `<w:sz w:val="28"/><w:szCs w:val="28"/><w:color w:val="404040"/></w:rPr>` +
+			`<w:t xml:space="preserve">` + esc(unit) + `</w:t></w:r></w:p>`
+	}
+
+	// ---------------- 期号 / 序号 ----------------
+	// 期号：解析年份 + 自增序号——用 brief.ID 取末两位作为期号尾，演示足够
+	now := time.Now()
+	year := now.Year()
+	if t, err := time.Parse("2006-01-02", period); err == nil {
+		year = t.Year()
+	}
+	// 期号简单按"年份序"展示（演示场景）：第 N 期 = 期间年内日序
+	issueNum := now.YearDay()
+	if t, err := time.Parse("2006-01-02", period); err == nil {
+		issueNum = t.YearDay()
+	}
+	issueLine := fmt.Sprintf("〔%d〕第 %d 期", year, issueNum)
+
+	// ---------------- 顶部：期号行 / 主标题 / 编印 / 红线 ----------------
+	var body strings.Builder
+
+	// 期号 + 密级（左 期号；右 ★（密级标识，党政办公文常见）—— 这里只放期号居左，密级符号居右）
+	// 用一个两端对齐段落实现："〔2026〕第 174 期 ……   秘密★1年"
+	body.WriteString(`<w:p><w:pPr><w:spacing w:line="480" w:lineRule="exact" w:before="0" w:after="0"/><w:tabs><w:tab w:val="right" w:pos="8820"/></w:tabs></w:pPr>`)
+	body.WriteString(`<w:r><w:rPr>` + font("仿宋_GB2312") + `<w:sz w:val="28"/><w:szCs w:val="28"/><w:color w:val="C00000"/></w:rPr>`)
+	body.WriteString(`<w:t xml:space="preserve">` + esc(issueLine) + `</w:t></w:r>`)
+	body.WriteString(`<w:r><w:tab/></w:r>`)
+	body.WriteString(`<w:r><w:rPr>` + font("仿宋_GB2312") + `<w:sz w:val="24"/><w:szCs w:val="24"/><w:color w:val="C00000"/></w:rPr>`)
+	body.WriteString(`<w:t xml:space="preserve">★ 内部资料 注意保存</w:t></w:r></w:p>`)
+
+	body.WriteString(emptyP())
+
+	// 主标题（小标宋，居中，红字，22pt）
+	body.WriteString(makeP(title, "方正小标宋简体", 44, "C00000", true, true, false, "exact"))
+	body.WriteString(emptyP())
+
+	// 编印机关 + 日期（仿宋，居中，灰）
+	dateStr := period
+	if t, err := time.Parse("2006-01-02", period); err == nil {
+		dateStr = fmt.Sprintf("%d年%d月%d日", t.Year(), t.Month(), t.Day())
+	}
+	body.WriteString(makeP("中共苏州工业园区党工委办公室  编印                    "+dateStr, "仿宋_GB2312", 24, "595959", false, true, false, "exact"))
+
+	// 红色分隔横线
+	body.WriteString(redLine())
+	body.WriteString(emptyP())
+
+	// ---------------- 统计 + 编者按 ----------------
+	highCount, midCount, lowCount := 0, 0, 0
 	for _, it := range items {
-		if it.Importance == "高" {
+		switch it.Importance {
+		case "高":
 			highCount++
-		} else if it.Importance == "中" {
+		case "中":
 			midCount++
+		default:
+			lowCount++
 		}
 	}
-	body += p(fmt.Sprintf("本期共收录 %d 条信息，其中高重要性 %d 条，中重要性 %d 条。", len(items), highCount, midCount))
-	body += p("", "")
-	body += p("二、条目正文", "h2")
-	for i, it := range items {
-		body += p(fmt.Sprintf("%d.【%s】%s", i+1, it.Importance, it.Title), "bold")
-		body += p("来源："+it.Unit, "meta")
-		if it.LeaderSummary != "" {
-			body += p("摘要：" + it.LeaderSummary)
+
+	body.WriteString(makeP("本 期 目 录", "黑体", 32, "C00000", true, true, false, "exact"))
+	body.WriteString(makeP(fmt.Sprintf("本期共编发信息 %d 条。其中，重要动态 %d 条，工作进展 %d 条，其他要闻 %d 条。",
+		len(items), highCount, midCount, lowCount), "仿宋_GB2312", 32, "", false, false, true, "exact"))
+
+	// 列出每条标题作为目录（按重要性顺序），公文目录右端用制表位对齐供稿单位
+	idx := 0
+	for _, key := range []string{"高", "中", "低"} {
+		for _, it := range items {
+			if it.Importance != key {
+				continue
+			}
+			idx++
+			body.WriteString(catalogRow(fmt.Sprintf("%s、%s", cnNum(idx), it.Title), "（"+it.Unit+"）"))
 		}
-		if it.URL != "" {
-			body += p("原文链接：" + it.URL, "meta")
-		}
-		body += p("", "")
 	}
+	body.WriteString(emptyP())
+
+	// ---------------- 本期综述（分析性内容，编者按） ----------------
+	if strings.TrimSpace(overview) != "" {
+		body.WriteString(makeP("本 期 综 述", "黑体", 32, "C00000", true, true, false, "exact"))
+		// 综述可能含多段，按换行拆分，逐段首行缩进
+		for _, seg := range strings.Split(strings.ReplaceAll(overview, "\r\n", "\n"), "\n") {
+			seg = strings.TrimSpace(seg)
+			if seg == "" {
+				continue
+			}
+			body.WriteString(makeP(seg, "仿宋_GB2312", 32, "000000", false, false, true, "exact"))
+		}
+		body.WriteString(emptyP())
+	}
+
+	// ---------------- 正文：按重要性分章节 ----------------
+	sections := []struct {
+		Key, Heading string
+	}{
+		{"高", "一、重要动态"},
+		{"中", "二、工作进展"},
+		{"低", "三、其他要闻"},
+	}
+	seq := 0 // 全文流水号
+	for _, sec := range sections {
+		// 统计该节是否有条目
+		count := 0
+		for _, it := range items {
+			if it.Importance == sec.Key {
+				count++
+			}
+		}
+		if count == 0 {
+			continue
+		}
+		body.WriteString(makeP(sec.Heading, "黑体", 32, "C00000", true, false, false, "exact"))
+		for _, it := range items {
+			if it.Importance != sec.Key {
+				continue
+			}
+			seq++
+			// 条目小标题：黑体小四，居中，公文简报每条以序号 + 标题成行
+			body.WriteString(makeP(fmt.Sprintf("（%s）%s", cnNum(seq), it.Title), "黑体", 32, "1F1F1F", true, true, false, "exact"))
+			// 正文摘要（仿宋三号，首行缩进 2 字）
+			summary := it.LeaderSummary
+			if summary == "" {
+				summary = it.DetailSummary
+			}
+			if summary != "" {
+				body.WriteString(makeP(summary, "仿宋_GB2312", 32, "000000", false, false, true, "exact"))
+			}
+			// 落款：右对齐供稿来源，公文体例「（××单位供稿　2026年1月2日）」
+			attrParts := []string{}
+			if it.Unit != "" {
+				attrParts = append(attrParts, it.Unit+"供稿")
+			}
+			if !it.PublishTime.IsZero() {
+				attrParts = append(attrParts, it.PublishTime.Format("2006年1月2日"))
+			}
+			if len(attrParts) > 0 {
+				body.WriteString(`<w:p><w:pPr><w:spacing w:line="560" w:lineRule="exact"/><w:jc w:val="right"/></w:pPr>` +
+					`<w:r><w:rPr>` + font("楷体_GB2312") + `<w:sz w:val="28"/><w:szCs w:val="28"/><w:color w:val="595959"/></w:rPr>` +
+					`<w:t xml:space="preserve">` + esc("（"+strings.Join(attrParts, "　")+"）") + `</w:t></w:r></w:p>`)
+			}
+			body.WriteString(emptyP())
+		}
+	}
+
+	// ---------------- 文末 报送栏 ----------------
+	body.WriteString(redLine())
+	body.WriteString(emptyP())
+
+	reportRow := func(label, value string) string {
+		// 二列布局：用 tab 分隔，左 4 字符宽
+		return `<w:p><w:pPr><w:spacing w:line="480" w:lineRule="exact"/><w:tabs><w:tab w:val="left" w:pos="1200"/></w:tabs></w:pPr>` +
+			`<w:r><w:rPr>` + font("黑体") + `<w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr><w:t xml:space="preserve">` + esc(label) + `</w:t></w:r>` +
+			`<w:r><w:tab/></w:r>` +
+			`<w:r><w:rPr>` + font("仿宋_GB2312") + `<w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr><w:t xml:space="preserve">` + esc(value) + `</w:t></w:r>` +
+			`</w:p>`
+	}
+	body.WriteString(reportRow("报：", "园区党工委、管委会领导"))
+	body.WriteString(reportRow("送：", "各处室、各功能区主要负责同志"))
+	body.WriteString(reportRow("抄送：", "存档"))
+	body.WriteString(reportRow("编印：", "党政办公室信息科  联系电话：0512-6XXX XXXX"))
+	body.WriteString(reportRow("印发：", fmt.Sprintf("%s   责任编辑：%s   共印 30 份", time.Now().Format("2006年1月2日"), editor)))
+
+	body.WriteString(emptyP())
+	body.WriteString(redLine())
+
+	// ---------------- 页面设置（A4 + 公文页边距）----------------
+	// A4 = 11906 × 16838 twips
+	// 上 37mm = 2097，下 35mm = 1984，左 28mm = 1588，右 26mm = 1474
+	pageSetup := `<w:sectPr>
+<w:pgSz w:w="11906" w:h="16838"/>
+<w:pgMar w:top="2097" w:right="1474" w:bottom="1984" w:left="1588" w:header="851" w:footer="992" w:gutter="0"/>
+<w:cols w:space="425"/>
+<w:docGrid w:type="lines" w:linePitch="312"/>
+</w:sectPr>`
 
 	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:body>` + body + `</w:body></w:document>`
+<w:body>` + body.String() + pageSetup + `</w:body></w:document>`
 }
 
 func zipDocx(documentXML string) ([]byte, error) {
