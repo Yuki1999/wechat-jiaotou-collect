@@ -74,7 +74,11 @@ http://192.168.0.130:8090/feed/<sha1>.xml
 ├── go.mod
 ├── index.html         # SPA 入口
 ├── static/
-│   ├── app.js         # Vue 组件 + 路由（7 个页面）
+│   ├── js/            # Vue 组件（ES module，无构建工具）
+│   │   ├── main.js    # 入口：路由 + 根组件
+│   │   ├── shared.js  # api 封装 / 全局 UI / 工具函数
+│   │   └── pages/     # 各页面组件
+│   ├── vendor/        # 本地化的 vue / vue-router 全局构建
 │   └── style.css
 ├── data.json          # 运行后生成
 ├── plan.docx          # 原方案文档

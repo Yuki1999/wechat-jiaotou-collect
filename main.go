@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"embed"
@@ -17,12 +18,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 //go:embed index.html static/*
@@ -207,8 +211,13 @@ func loadStore() *Store {
 // 同时预留两条 RSS / wechat2rss 占位条目（默认停用，部署 wechat2rss 后填入 URL 即可启用）。
 
 func seed(s *Store) {
-	// 演示默认密码（生产环境务必修改）
-	defPwHash := sha256full("dzb2025")
+	// 初始默认密码：可用 SEED_DEFAULT_PASSWORD 覆盖；否则用强默认值。首次登录后务必修改。
+	// 采用 bcrypt（自带盐）。
+	defPw := strings.TrimSpace(os.Getenv("SEED_DEFAULT_PASSWORD"))
+	if defPw == "" {
+		defPw = "Sipdzb@2026!chg"
+	}
+	defPwHash := hashPassword(defPw)
 	users := []User{
 		{Name: `张主任`, Username: "zhang", Group: `综合组`, Role: "leader"},
 		{Name: `李审核`, Username: "li", Group: `综合组`, Role: "reviewer"},
@@ -525,10 +534,73 @@ func sha256hex(s string) string {
 	return hex.EncodeToString(h[:])[:16]
 }
 
-// sha256full 完整 64 位 sha256 hex，用于密码哈希
+// sha256full 完整 64 位 sha256 hex（旧版密码哈希，仅用于向后兼容登录）。
 func sha256full(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// ---------- 密码哈希：bcrypt（自带盐），兼容旧版无盐 sha256 ----------
+
+// hashPassword 用 bcrypt 生成带盐的密码哈希。
+func hashPassword(plain string) string {
+	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// isLegacyHash 判断是否旧版无盐 sha256（64 位纯十六进制）。
+func isLegacyHash(h string) bool {
+	if len(h) != 64 {
+		return false
+	}
+	for _, c := range h {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// checkPassword 校验明文密码：旧版走 sha256 比对，新版走 bcrypt。
+func checkPassword(hash, plain string) bool {
+	if isLegacyHash(hash) {
+		return hash == sha256full(plain)
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
+}
+
+// ---------- 会话 / 归属组写入管控 ----------
+
+// actor 取当前登录用户（requireAuth 已注入到 context）。
+func actor(r *http.Request) *Session {
+	if s, ok := r.Context().Value(ctxSessionKey).(*Session); ok && s != nil {
+		return s
+	}
+	return currentSession(r)
+}
+
+// actorName 返回操作者显示名（用于审计留痕），取不到时回退。
+func actorName(r *http.Request) string {
+	if s := actor(r); s != nil && s.Name != "" {
+		return s.Name
+	}
+	return "系统"
+}
+
+// canWriteGroup 判断当前用户能否写某归属组的数据：
+// admin / leader 可跨组；其他角色仅限本组。空组视为公共，放行。
+func canWriteGroup(r *http.Request, group string) bool {
+	s := actor(r)
+	if s == nil {
+		return false
+	}
+	if s.Role == "admin" || s.Role == "leader" {
+		return true
+	}
+	return group == "" || s.Group == group
 }
 
 // ----- RSS / Atom 解析（用于 wechat2rss 与通用 RSS） -----
@@ -1744,7 +1816,7 @@ func apiAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"err": "该账号已被禁用，请联系管理员", "code": "user_disabled"})
 		return
 	}
-	if found.PasswordHash != sha256full(in.Password) {
+	if !checkPassword(found.PasswordHash, in.Password) {
 		sessions.recordFailure(in.Username)
 		w.WriteHeader(401)
 		writeJSON(w, map[string]string{"err": "密码错误", "code": "wrong_password"})
@@ -1752,12 +1824,19 @@ func apiAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessions.clearFailures(in.Username)
-	// 更新 last_login
+	// 更新 last_login；若仍是旧版无盐 sha256 哈希，登录成功时透明升级为 bcrypt。
+	upgrade := ""
+	if isLegacyHash(found.PasswordHash) {
+		upgrade = hashPassword(in.Password)
+	}
 	var updated User
 	store.mu.Lock()
 	for i := range store.Users {
 		if store.Users[i].ID == found.ID {
 			store.Users[i].LastLoginAt = time.Now()
+			if upgrade != "" {
+				store.Users[i].PasswordHash = upgrade
+			}
 			updated = store.Users[i]
 		}
 	}
@@ -1826,13 +1905,13 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 	store.mu.Lock()
 	for i := range store.Users {
 		if store.Users[i].ID == s.UserID {
-			if store.Users[i].PasswordHash != sha256full(in.OldPassword) {
+			if !checkPassword(store.Users[i].PasswordHash, in.OldPassword) {
 				store.mu.Unlock()
 				w.WriteHeader(400)
 				writeJSON(w, map[string]string{"err": "原密码错误"})
 				return
 			}
-			store.Users[i].PasswordHash = sha256full(in.NewPassword)
+			store.Users[i].PasswordHash = hashPassword(in.NewPassword)
 			updated = store.Users[i]
 			break
 		}
@@ -2238,7 +2317,7 @@ func main() {
 	go schedulerLoop()
 
 	sub, _ := fs.Sub(assets, "static")
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
+	http.Handle("/static/", http.StripPrefix("/static/", staticHandler(http.FileServer(http.FS(sub)))))
 
 	// ---- /api/auth/* （登录 / 注销 / 当前用户） ----
 	http.HandleFunc("/api/auth/login", apiAuthLogin)
@@ -2314,6 +2393,48 @@ func main() {
 	addr := ":" + port
 	log.Printf("党政办信息跟踪与智能整理系统启动: http://0.0.0.0:%s", port)
 	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+// staticHandler 给 /static/ 静态资源加缓存策略与 gzip 压缩。
+// vendor/ 下为固定版本号的第三方库，长缓存；其余短缓存。
+func staticHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 注意：StripPrefix 之后的路径没有前导斜杠（如 "vendor/vue.global.prod.js"）
+		if strings.HasPrefix(r.URL.Path, "vendor/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=300")
+		}
+		// 仅压缩文本类资源，且客户端声明支持 gzip 时
+		switch path.Ext(r.URL.Path) {
+		case ".js", ".css", ".html", ".svg", ".json":
+		default:
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, gz: gz}, r)
+	})
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz *gzip.Writer
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) { return g.gz.Write(b) }
+
+// gzip 后长度未知，必须在 WriteHeader 前去掉 FileServer 设置的 Content-Length
+func (g *gzipResponseWriter) WriteHeader(code int) {
+	g.ResponseWriter.Header().Del("Content-Length")
+	g.ResponseWriter.WriteHeader(code)
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
@@ -2795,12 +2916,17 @@ func apiArticleUpdate(w http.ResponseWriter, r *http.Request) {
 		Note          string `json:"note"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&in)
+	who := actorName(r)
 	var updatedArt Article
 	var rv ReviewLog
-	found := false
+	found, denied := false, false
 	store.mu.Lock()
 	for i := range store.Articles {
 		if store.Articles[i].ID == in.ID {
+			if !canWriteGroup(r, store.Articles[i].Group) {
+				denied = true
+				break
+			}
 			before, _ := json.Marshal(store.Articles[i])
 			store.Articles[i].Summary = in.Summary
 			store.Articles[i].LeaderSummary = in.LeaderSummary
@@ -2809,7 +2935,7 @@ func apiArticleUpdate(w http.ResponseWriter, r *http.Request) {
 			after, _ := json.Marshal(store.Articles[i])
 			rv = ReviewLog{
 				ID: store.nextID("review"), ArticleID: in.ID,
-				Reviewer: `王审核`, Action: "edit",
+				Reviewer: who, Action: "edit",
 				Before: string(before), After: string(after),
 				Note: in.Note, OccurredAt: time.Now(),
 			}
@@ -2820,6 +2946,10 @@ func apiArticleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	store.mu.Unlock()
+	if denied {
+		http.Error(w, "无权修改其他业务组的稿件", http.StatusForbidden)
+		return
+	}
 	if found {
 		dbUpsertArticle(updatedArt)
 		dbInsertReview(rv)
@@ -2829,15 +2959,20 @@ func apiArticleUpdate(w http.ResponseWriter, r *http.Request) {
 
 func apiArticleApprove(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+	who := actorName(r)
 	var updatedArt Article
 	var rv ReviewLog
-	found := false
+	found, denied := false, false
 	store.mu.Lock()
 	for i := range store.Articles {
 		if store.Articles[i].ID == id {
+			if !canWriteGroup(r, store.Articles[i].Group) {
+				denied = true
+				break
+			}
 			store.Articles[i].Status = "approved"
 			rv = ReviewLog{
-				ID: store.nextID("review"), ArticleID: id, Reviewer: `王审核`,
+				ID: store.nextID("review"), ArticleID: id, Reviewer: who,
 				Action: "approve", Note: `审核通过`, OccurredAt: time.Now(),
 			}
 			store.Reviews = append(store.Reviews, rv)
@@ -2847,6 +2982,10 @@ func apiArticleApprove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	store.mu.Unlock()
+	if denied {
+		http.Error(w, "无权审核其他业务组的稿件", http.StatusForbidden)
+		return
+	}
 	if found {
 		dbUpsertArticle(updatedArt)
 		dbInsertReview(rv)
@@ -2857,15 +2996,20 @@ func apiArticleApprove(w http.ResponseWriter, r *http.Request) {
 func apiArticleReject(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
 	note := r.URL.Query().Get("note")
+	who := actorName(r)
 	var updatedArt Article
 	var rv ReviewLog
-	found := false
+	found, denied := false, false
 	store.mu.Lock()
 	for i := range store.Articles {
 		if store.Articles[i].ID == id {
+			if !canWriteGroup(r, store.Articles[i].Group) {
+				denied = true
+				break
+			}
 			store.Articles[i].Status = "archived"
 			rv = ReviewLog{
-				ID: store.nextID("review"), ArticleID: id, Reviewer: `王审核`,
+				ID: store.nextID("review"), ArticleID: id, Reviewer: who,
 				Action: "reject", Note: note, OccurredAt: time.Now(),
 			}
 			store.Reviews = append(store.Reviews, rv)
@@ -2875,6 +3019,10 @@ func apiArticleReject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	store.mu.Unlock()
+	if denied {
+		http.Error(w, "无权驳回其他业务组的稿件", http.StatusForbidden)
+		return
+	}
 	if found {
 		dbUpsertArticle(updatedArt)
 		dbInsertReview(rv)
@@ -3159,9 +3307,13 @@ func apiBriefGenerate(w http.ResponseWriter, r *http.Request) {
 		cutoff = now.Add(-90 * 24 * time.Hour)
 		period = now.Format("2006-01")
 	}
+	grp := effectiveGroup(r) // 按操作者归属组过滤（admin/leader 可跨组，返回 ""）
 	ids := []int{}
 	entries := []briefEntry{}
 	for _, a := range store.Articles {
+		if grp != "" && a.Group != grp {
+			continue
+		}
 		if a.PublishTime.Before(cutoff) {
 			continue
 		}
@@ -3194,7 +3346,7 @@ func apiBriefGenerate(w http.ResponseWriter, r *http.Request) {
 		Status:     "draft",
 		ArticleIDs: ids,
 		Overview:   overview,
-		Editor:     `王审核`,
+		Editor:     actorName(r),
 		CreatedAt:  now,
 	}
 	store.mu.Lock()
@@ -3431,7 +3583,7 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 		store.Articles[c.idx].Status = "approved"
 		rv := ReviewLog{
 			ID: store.nextID("review"), ArticleID: store.Articles[c.idx].ID,
-			Reviewer: `王审核`, Action: "approve",
+			Reviewer: actorName(r), Action: "approve",
 			Note: `[演示] 系统自动审核通过`, OccurredAt: time.Now(),
 		}
 		store.Reviews = append(store.Reviews, rv)
@@ -3471,7 +3623,7 @@ func apiDemoFull(w http.ResponseWriter, r *http.Request) {
 		Title:      briefTitle("daily", now.Format("2006-01-02")),
 		Status:     "draft",
 		ArticleIDs: ids,
-		Editor:     `王审核`,
+		Editor:     actorName(r),
 		CreatedAt:  now,
 	}
 	store.Briefs = append(store.Briefs, brief)

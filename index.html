@@ -3,10 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>党政办信息跟踪与智能整理系统 · Demo</title>
+<title>党政办信息跟踪与智能整理系统</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23b32424'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='%23f5e3b3' font-family='serif' font-weight='bold'%3E%E5%85%9A%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
-<script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
-<script src="https://unpkg.com/vue-router@4.3.0/dist/vue-router.global.prod.js"></script>
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/vendor/vue-router.global.prod.js"></script>
 </head>
 <body>
 <div id="app" :class="{ 'app-anon': isAnon }">
@@ -93,12 +94,12 @@
   <!-- 全局组件容器 -->
   <div class="global-progress" :class="{ active: ui.progress.active, done: ui.progress.done }"></div>
 
-  <div class="toast-stack">
+  <div class="toast-stack" aria-live="polite">
     <div v-for="t in ui.toasts" :key="t.id"
          class="toast" :class="[t.type, { leaving: t.leaving }]">
       <span class="toast-icon">{{ t.icon }}</span>
       <span class="toast-body">{{ t.message }}</span>
-      <button class="toast-close" @click="closeToast(t.id)">✕</button>
+      <button class="toast-close" @click="closeToast(t.id)" aria-label="关闭提示">✕</button>
     </div>
   </div>
 
@@ -106,7 +107,7 @@
     <div class="modal" :class="{ lg: ui.modal.large }">
       <div class="modal-head">
         <h3>{{ ui.modal.title }}</h3>
-        <button class="modal-close" @click="resolveModal(false)">✕</button>
+        <button class="modal-close" @click="resolveModal(false)" aria-label="关闭">✕</button>
       </div>
       <div class="modal-body">
         <div v-if="ui.modal.message" style="white-space:pre-wrap;">{{ ui.modal.message }}</div>
@@ -133,12 +134,12 @@
     <div v-if="ui.drawer.show" class="drawer">
       <div class="drawer-head">
         <h3>{{ ui.drawer.title }}</h3>
-        <button class="modal-close" @click="ui.drawer.show=false">✕</button>
+        <button class="modal-close" @click="ui.drawer.show=false" aria-label="关闭">✕</button>
       </div>
       <div class="drawer-body" v-html="ui.drawer.content"></div>
     </div>
   </transition>
 </div>
-<script src="/static/app.js"></script>
+<script type="module" src="/static/js/main.js"></script>
 </body>
 </html>

@@ -290,8 +290,11 @@ func persistFullSnapshot(s *Store) error {
 func loadStoreFromDB(ctx context.Context) (*Store, error) {
 	s := &Store{NextIDs: map[string]int{}}
 
+	// 说明：应用自身写入从不产生 NULL（Go 零值 → ''/0/false），但为容忍手工改库 /
+	// 数据迁移 / 表结构演进导致的 NULL，读取端一律 COALESCE，避免单条 NULL 让全表装载失败。
+
 	// users
-	rows, err := dbPool.Query(ctx, `SELECT id,name,username,password_hash,"group",role,active,created_at,last_login_at FROM users ORDER BY id`)
+	rows, err := dbPool.Query(ctx, `SELECT id,COALESCE(name,''),COALESCE(username,''),COALESCE(password_hash,''),COALESCE("group",''),COALESCE(role,''),COALESCE(active,false),created_at,last_login_at FROM users ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +311,7 @@ func loadStoreFromDB(ctx context.Context) (*Store, error) {
 	rows.Close()
 
 	// sources
-	rows, err = dbPool.Query(ctx, `SELECT id,unit,category,type,kind,url,frequency,owner_id,owner_name,"group",active,authorized,last_success,fail_count,created_at FROM sources ORDER BY id`)
+	rows, err = dbPool.Query(ctx, `SELECT id,COALESCE(unit,''),COALESCE(category,''),COALESCE(type,''),COALESCE(kind,''),COALESCE(url,''),COALESCE(frequency,''),COALESCE(owner_id,0),COALESCE(owner_name,''),COALESCE("group",''),COALESCE(active,false),COALESCE(authorized,false),last_success,COALESCE(fail_count,0),created_at FROM sources ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +328,7 @@ func loadStoreFromDB(ctx context.Context) (*Store, error) {
 	rows.Close()
 
 	// articles
-	rows, err = dbPool.Query(ctx, `SELECT id,source_id,unit,source_type,title,content,url,publish_time,fetch_time,content_hash,status,importance,category,summary,leader_summary,detail_summary,keywords,topics,confidence,ai_engine,ai_error,evidence,duplicate_of,owner_id,owner_name,"group" FROM articles ORDER BY id`)
+	rows, err = dbPool.Query(ctx, `SELECT id,COALESCE(source_id,0),COALESCE(unit,''),COALESCE(source_type,''),COALESCE(title,''),COALESCE(content,''),COALESCE(url,''),publish_time,fetch_time,COALESCE(content_hash,''),COALESCE(status,''),COALESCE(importance,''),COALESCE(category,''),COALESCE(summary,''),COALESCE(leader_summary,''),COALESCE(detail_summary,''),keywords,topics,COALESCE(confidence,0),COALESCE(ai_engine,''),COALESCE(ai_error,''),COALESCE(evidence,''),COALESCE(duplicate_of,0),COALESCE(owner_id,0),COALESCE(owner_name,''),COALESCE("group",'') FROM articles ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +350,7 @@ func loadStoreFromDB(ctx context.Context) (*Store, error) {
 	rows.Close()
 
 	// reviews
-	rows, err = dbPool.Query(ctx, `SELECT id,article_id,reviewer,action,before,after,note,occurred_at FROM reviews ORDER BY id`)
+	rows, err = dbPool.Query(ctx, `SELECT id,COALESCE(article_id,0),COALESCE(reviewer,''),COALESCE(action,''),COALESCE(before,''),COALESCE(after,''),COALESCE(note,''),occurred_at FROM reviews ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +367,7 @@ func loadStoreFromDB(ctx context.Context) (*Store, error) {
 	rows.Close()
 
 	// briefs
-	rows, err = dbPool.Query(ctx, `SELECT id,type,period,title,status,article_ids,overview,editor,created_at,published_at FROM briefs ORDER BY id`)
+	rows, err = dbPool.Query(ctx, `SELECT id,COALESCE(type,''),COALESCE(period,''),COALESCE(title,''),COALESCE(status,''),article_ids,COALESCE(overview,''),COALESCE(editor,''),created_at,published_at FROM briefs ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -383,7 +386,7 @@ func loadStoreFromDB(ctx context.Context) (*Store, error) {
 	rows.Close()
 
 	// pushes
-	rows, err = dbPool.Query(ctx, `SELECT id,channel,target,subject,brief_id,article_id,status,return_code,occurred_at FROM pushes ORDER BY id`)
+	rows, err = dbPool.Query(ctx, `SELECT id,COALESCE(channel,''),COALESCE(target,''),COALESCE(subject,''),COALESCE(brief_id,0),COALESCE(article_id,0),COALESCE(status,''),COALESCE(return_code,''),occurred_at FROM pushes ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +403,7 @@ func loadStoreFromDB(ctx context.Context) (*Store, error) {
 	rows.Close()
 
 	// tasks（仅保留最近 taskRetention 条）
-	rows, err = dbPool.Query(ctx, `SELECT id,source_id,unit,started_at,finished_at,status,found,new_items,error FROM (
+	rows, err = dbPool.Query(ctx, `SELECT id,COALESCE(source_id,0),COALESCE(unit,''),started_at,finished_at,COALESCE(status,''),COALESCE(found,0),COALESCE(new_items,0),COALESCE(error,'') FROM (
 		SELECT * FROM tasks ORDER BY id DESC LIMIT $1) t ORDER BY id`, taskRetention)
 	if err != nil {
 		return nil, err
